@@ -1,126 +1,132 @@
 import torch
 import torch.nn as nn
-import torchaudio
-from torchaudio.models import Conformer
-from scipy.optimize import linear_sum_assignment
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
 
 
-class SpatialAudioTransformer(nn.Module):
-    def __init__(self, input_channels=2, embed_dim=256, n_heads=8):
+class SpatialAudioHeatmapLocator(nn.Module):
+    def __init__(self, input_channels=2, azi_bins=72, dist_bins=20):
         super().__init__()
+        self.azi_bins = azi_bins
+        self.dist_bins = dist_bins
 
-        self.embed_dim = embed_dim
-
-        # --- ENCODER: ResNet + Conformer ---
-        self.front_end = nn.Sequential(
+        # 1. ENCODER: Optimized for Phase
+        self.encoder = nn.Sequential(
             nn.Conv2d(input_channels, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(2),  # Freq 128 -> 64
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.Conv2d(64, 128, kernel_size=3, padding=2, dilation=2),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.MaxPool2d(2),  # Freq 64 -> 32
+            nn.Conv2d(128, 256, kernel_size=3, stride=(2, 2), padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, None)),
         )
-        self.enc_proj = nn.Linear(128 * 32, embed_dim)
-        self.conformer = Conformer(
-            input_dim=embed_dim,
-            ffn_dim=embed_dim * 4,  # This was the missing piece!
-            num_heads=n_heads,
-            num_layers=4,
-            depthwise_conv_kernel_size=31,
-        )
-        # --- DECODER ---
-        # Projects 3D coords + 1 EOE bit back to latent space for autoregression
-        self.coord_embedder = nn.Linear(4, embed_dim)
 
-        decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=n_heads, batch_first=True)
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=4)
+        self.rnn = nn.GRU(input_size=256, hidden_size=256, num_layers=2, batch_first=True, bidirectional=True)
 
-        # Output: [Azimuth, Elevation, Distance, EOE_Probability]
-        self.fc_out = nn.Linear(embed_dim, 4)
-        self.sos_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        # 2. THE HEATMAP HEAD
+        # We output 1440 values (72 * 20)
+        self.heatmap_head = nn.Linear(256 * 2, azi_bins * dist_bins)
 
-    def forward(self, x, target_seq=None):
-        b = x.shape[0]
+    def forward(self, x):
+        x = self.encoder(x)
+        x = x.squeeze(2).permute(0, 2, 1)
+        rnn_out, _ = self.rnn(x)
+        last_state = rnn_out[:, -1, :]
 
-        # Encode
-        x = self.front_end(x)
-        x = x.permute(0, 3, 1, 2).reshape(b, -1, 128 * 32)
-        memory, _ = self.conformer(self.enc_proj(x), torch.full((b,), x.size(1), device=x.device))
+        # Output flattened heatmap
+        logits = self.heatmap_head(last_state)
+        # Reshape to (Batch, Azimuth, Distance)
+        return logits.view(-1, self.azi_bins, self.dist_bins)
 
-        if self.training:
-            assert target_seq is not None, "target_seq is not set while training."
-            # Teacher Forcing: Project target coords to embedding space
-            # target_seq shape: (B, Num_Sources, 4)
-            sos = self.sos_token.expand(b, -1, -1)
-            target_embedded = self.coord_embedder(target_seq)
-            decoder_input = torch.cat([sos, target_embedded], dim=1)[:, :-1, :]
-
-            out = self.decoder(decoder_input, memory)
-            return self.fc_out(out)
-
-        else:
-            # Inference: Recursive generation
-            results = []
-            curr_input = self.sos_token.expand(b, -1, -1)
-
-            for _ in range(10):  # Max sources
-                out = self.decoder(curr_input, memory)
-                pred = self.fc_out(out[:, -1:, :])
-                results.append(pred)
-
-                # Check EOE (if 4th value > 0.5)
-                if torch.sigmoid(pred[0, 0, 3]) > 0.5:
-                    break
-
-                next_emb = self.coord_embedder(pred)
-                curr_input = torch.cat([curr_input, next_emb], dim=1)
-
-            return torch.cat(results, dim=1)
-
-
-# --- Hungarian Loss Implementation ---
-def spatial_hungarian_loss(predictions, targets):
+def visualize_heatmap(heatmap_tensor, title="3D Audio Heatmap"):
     """
-    predictions: (Batch, N, 4) -> [A, E, D, EOE]
-    targets: (Batch, M, 4)
+    heatmap_tensor: torch.Tensor of shape (azi_bins, dist_bins)
     """
-    batch_size = predictions.size(0)
+    # Convert to numpy for plotting
+    data = torch.sigmoid(heatmap_tensor).detach().cpu().numpy()
+    
+    azi_bins, dist_bins = data.shape
+    
+    # Create coordinate grids
+    # Azimuth: 0 to 2*pi
+    # Distance: 0 to max_bins
+    azimuths = np.linspace(0, 2 * np.pi, azi_bins)
+    distances = np.linspace(0, dist_bins, dist_bins)
+    
+    R, Theta = np.meshgrid(distances, azimuths)
+
+    # Plotting
+    fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(8, 8))
+    
+    # pcolormesh creates the "Heat" map
+    pc = ax.pcolormesh(Theta, R, data, shading='auto', cmap='magma')
+    
+    ax.set_theta_zero_location("N") # 0 degrees at the top
+    ax.set_theta_direction(-1)     # Clockwise
+    
+    plt.colorbar(pc, ax=ax, label='Probability Intensity')
+    plt.title(title)
+    plt.show()
+
+# --- 2D GAUSSIAN SMOOTHING ---
+
+
+def get_2d_gaussian_heatmap(target_azi_idx, target_dist_idx, azi_bins=72, dist_bins=20, sigma=1.2):
+    """Creates a 2D 'blob' of probability on the radar map."""
+    azi_range = torch.arange(azi_bins).float()
+    dist_range = torch.arange(dist_bins).float()
+
+    # Grid of coordinates
+    azi_grid, dist_grid = torch.meshgrid(azi_range, dist_range, indexing="ij")
+
+    # Calculate distance from target (Circular for Azimuth)
+    d_azi = torch.min(torch.abs(azi_grid - target_azi_idx), azi_bins - torch.abs(azi_grid - target_azi_idx))
+    d_dist = torch.abs(dist_grid - target_dist_idx)
+
+    # 2D Gaussian formula
+    heatmap = torch.exp(-(d_azi**2 + d_dist**2) / (2 * sigma**2))
+    return heatmap / heatmap.max()
+
+
+def heatmap_loss(pred_heatmap, target_sources, azi_bins=72, dist_bins=20):
+    """
+    target_sources: List of (azi_idx, dist_idx) for one batch item
+    This allows training with multiple sources in the same clip.
+    """
+    batch_size = pred_heatmap.size(0)
     total_loss = 0
 
-    # We use MSE for the first 3 (coords) and BCE for the 4th (EOE)
-    mse = nn.MSELoss(reduction="none")
-    bce = nn.BCEWithLogitsLoss(reduction="none")
+    for i in range(batch_size):
+        # Build the ground truth heatmap by combining blobs for each source
+        gt_heatmap = torch.zeros(azi_bins, dist_bins).to(pred_heatmap.device)
+        for azi_idx, dist_idx in target_sources[i]:
+            blob = get_2d_gaussian_heatmap(azi_idx, dist_idx, azi_bins, dist_bins)
+            gt_heatmap = torch.max(gt_heatmap, blob.to(pred_heatmap.device))
 
-    for b in range(batch_size):
-        pred_coords = predictions[b, :, :3]  # (N, 3)
-        true_coords = targets[b, :, :3]  # (M, 3)
-
-        # 1. Compute Cost Matrix (Distance between every pred and every truth)
-        # Using simple Euclidean distance for the matching cost
-        cost_matrix = torch.cdist(pred_coords, true_coords).cpu().detach().numpy()
-
-        # 2. Hungarian Matching (find optimal pairs)
-        row_idx, col_idx = linear_sum_assignment(cost_matrix)
-
-        # 3. Calculate Loss for matched pairs
-        coord_loss = mse(pred_coords[row_idx], true_coords[col_idx]).mean()
-        eoe_loss = bce(predictions[b, :, 3], targets[b, :, 3]).mean()
-
-        total_loss += coord_loss + eoe_loss
+        total_loss += F.binary_cross_entropy_with_logits(pred_heatmap[i], gt_heatmap)
 
     return total_loss / batch_size
 
 
-# --- Runtime Example ---
-model = SpatialAudioTransformer()
-# Fake 2-channel MelSpec: (B=1, C=2, F=128, T=100)
-audio_input = torch.randn(1, 2, 128, 100)
-# Fake Ground Truth: 2 sources + 1 EOE token
-# Each source: [Azim, Elev, Dist, EOE_Flag]
-gt_sources = torch.tensor([[[0.5, 0.1, 2.0, 0.0], [-0.5, 0.0, 1.5, 0.0], [0.0, 0.0, 0.0, 1.0]]])
+# --- RUNTIME EXAMPLE ---
 
-# Forward pass
-output = model(audio_input, target_seq=gt_sources)
-loss = spatial_hungarian_loss(output, gt_sources)
+if __name__ == "__main__":
+    # 1. Initialize with random weights
+    model = SpatialAudioHeatmapLocator(input_channels=2, azi_bins=72, dist_bins=20)
+    
+    # 2. Create fake Stereo Audio Input (Batch, Channels, Freq, Time)
+    # Using 128 Mel bins and 100 time frames
+    fake_audio = torch.randn(1, 2, 128, 100)
 
-print(f"Loss value: {loss.item():.4f}")
+    print("Running forward pass...")
+    # 3. Model Inference
+    model.eval()
+    with torch.no_grad():
+        raw_output = model(fake_audio) # Output shape: (1, 72, 20)
+    
+    # 4. Strip the batch dimension and visualize
+    print("Visualizing raw (untrained) weights...")
+    visualize_heatmap(raw_output.squeeze(0))
