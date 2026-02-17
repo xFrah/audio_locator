@@ -28,13 +28,11 @@ def train(dataset_dir="dataset",
     chunks_t = torch.from_numpy(chunks)   # (N, 2, n_mels, T)
     labels_t = torch.from_numpy(labels)   # (N, azi_bins, dist_bins)
 
-    # --- 2. Train/val split (70/30) ---
+    # --- 2. Train/val split (70/30) — sequential, no shuffle ---
     split = int(num_samples * 0.7)
-    perm = torch.randperm(num_samples)
-    train_idx, val_idx = perm[:split], perm[split:]
 
-    train_chunks, train_labels = chunks_t[train_idx], labels_t[train_idx]
-    val_chunks, val_labels = chunks_t[val_idx], labels_t[val_idx]
+    train_chunks, train_labels = chunks_t[:split], labels_t[:split]
+    val_chunks, val_labels = chunks_t[split:], labels_t[split:]
     print(f"Train: {len(train_chunks)}  Val: {len(val_chunks)}")
 
     # --- 3. Model, optimizer ---
