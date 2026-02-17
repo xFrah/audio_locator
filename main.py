@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 
+from convert_wav import prepare_audio_input_librosa
+
 
 class SpatialAudioHeatmapLocator(nn.Module):
     def __init__(self, input_channels=2, azi_bins=72, dist_bins=20):
@@ -117,15 +119,15 @@ if __name__ == "__main__":
     # 1. Initialize with random weights
     model = SpatialAudioHeatmapLocator(input_channels=2, azi_bins=72, dist_bins=20)
     
-    # 2. Create fake Stereo Audio Input (Batch, Channels, Freq, Time)
-    # Using 128 Mel bins and 100 time frames
-    fake_audio = torch.randn(1, 2, 128, 100)
+    # 2. Load real audio
+    real_audio = prepare_audio_input_librosa(r"output\gunshot_azi75_dist1.wav")
+    print(f"Input shape: {real_audio.shape}")  # [1, 2, 128, T]
 
     print("Running forward pass...")
     # 3. Model Inference
     model.eval()
     with torch.no_grad():
-        raw_output = model(fake_audio) # Output shape: (1, 72, 20)
+        raw_output = model(real_audio)  # Output shape: (1, 72, 20)
     
     # 4. Strip the batch dimension and visualize
     print("Visualizing raw (untrained) weights...")
