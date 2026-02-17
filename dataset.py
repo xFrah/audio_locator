@@ -9,12 +9,13 @@ from tqdm import tqdm
 
 from convert_wav import (
     DEFAULT_SAMPLE_RATE, DEFAULT_N_FFT, DEFAULT_HOP_LENGTH,
-    DEFAULT_N_MELS, DEFAULT_WINDOW_SIZE_SECONDS,
+    DEFAULT_N_MELS, DEFAULT_WINDOW_SIZE_SECONDS, DEFAULT_GCC_MAX_TAU,
+    DEFAULT_FREQ_BINS, NUM_FEATURE_CHANNELS, compute_spatial_features,
 )
 
 
 def _gaussian_heatmap(target_azi_idx, target_dist_idx,
-                      azi_bins=72, dist_bins=20, sigma=1.2):
+                      azi_bins=36, dist_bins=5, sigma=1.2):
     """Creates a 2D gaussian blob on the heatmap grid (numpy version)."""
     azi_range = np.arange(azi_bins, dtype=np.float32)
     dist_range = np.arange(dist_bins, dtype=np.float32)
@@ -65,18 +66,17 @@ def _spatialize_sound(args):
 
 
 def _compute_spectrogram(args):
-    """Worker: compute mel spectrogram for one window."""
-    win_idx, audio_chunk_ch0, audio_chunk_ch1, sr, n_mels, n_fft, hop_length = args
+    """Worker: compute spatial features for one window."""
+    win_idx, audio_chunk_ch0, audio_chunk_ch1, sr, n_mels, n_fft, hop_length, n_gcc_bins = args
 
-    specs = []
-    for ch_data in [audio_chunk_ch0, audio_chunk_ch1]:
-        S = librosa.feature.melspectrogram(
-            y=ch_data.astype(np.float32), sr=sr,
-            n_mels=n_mels, n_fft=n_fft, hop_length=hop_length
-        )
-        specs.append(librosa.power_to_db(S, ref=np.max))
+    features = compute_spatial_features(
+        audio_chunk_ch0.astype(np.float32),
+        audio_chunk_ch1.astype(np.float32),
+        sr=sr, n_fft=n_fft, hop_length=hop_length,
+        n_mels=n_mels, n_gcc_bins=n_gcc_bins,
+    )  # (7, F_max, T)
 
-    return win_idx, np.stack(specs)  # (2, n_mels, T)
+    return win_idx, features
 
 
 def generate_dataset(total_duration_seconds=300,
@@ -87,13 +87,13 @@ def generate_dataset(total_duration_seconds=300,
                      n_mels=DEFAULT_N_MELS,
                      n_fft=DEFAULT_N_FFT,
                      hop_length=DEFAULT_HOP_LENGTH,
-                     azi_bins=72,
-                     dist_bins=20,
+                     azi_bins=36,
+                     dist_bins=5,
                      max_distance=3.0,
                      sigma=1.2,
                      sounds_dir=r"sounds\sounds",
                      output_dir="dataset",
-                     num_workers=None,
+                     num_workers=14,
                      seed=None):
     """Generate audio in memory, slice into windows, compute mel spectrograms,
     and save chunks + labels as .npy. Uses multiprocessing for speed.
@@ -152,21 +152,22 @@ def generate_dataset(total_duration_seconds=300,
     if peak > 0:
         stereo_buffer = stereo_buffer / peak * 0.9
 
-    # --- 4. Compute spectrograms in parallel ---
+    # --- 4. Compute spatial features in parallel ---
     window_samples = int(window_size_seconds * sr)
     hop_samples = int(sr * update_interval_ms / 1000)
     assert window_samples >= hop_samples, (
         f"Window ({window_size_seconds}s) must be >= hop ({update_interval_ms}ms)")
 
     num_windows = (total_samples - window_samples) // hop_samples + 1
-    print(f"\nComputing spectrograms for {num_windows} windows...")
+    print(f"\nComputing spatial features for {num_windows} windows...")
 
-    # Pre-compute T
-    dummy_spec = librosa.feature.melspectrogram(
-        y=np.zeros(window_samples, dtype=np.float32), sr=sr,
-        n_mels=n_mels, n_fft=n_fft, hop_length=hop_length
-    )
-    T = dummy_spec.shape[1]
+    n_gcc_bins = DEFAULT_GCC_MAX_TAU
+    F_max = n_fft // 2 + 1  # 1025
+
+    # Pre-compute T from a dummy STFT
+    dummy_stft = librosa.stft(np.zeros(window_samples, dtype=np.float32),
+                              n_fft=n_fft, hop_length=hop_length)
+    T = dummy_stft.shape[1]
 
     # Build spectrogram jobs
     spec_jobs = []
@@ -174,13 +175,13 @@ def generate_dataset(total_duration_seconds=300,
         win_start = win_idx * hop_samples
         win_end = win_start + window_samples
         chunk = stereo_buffer[:, win_start:win_end]
-        spec_jobs.append((win_idx, chunk[0], chunk[1], sr, n_mels, n_fft, hop_length))
+        spec_jobs.append((win_idx, chunk[0], chunk[1], sr, n_mels, n_fft, hop_length, n_gcc_bins))
 
-    chunks = np.zeros((num_windows, 2, n_mels, T), dtype=np.float32)
+    chunks = np.zeros((num_windows, NUM_FEATURE_CHANNELS, F_max, T), dtype=np.float32)
 
     with ProcessPoolExecutor(max_workers=num_workers) as pool:
         results = list(tqdm(pool.map(_compute_spectrogram, spec_jobs, chunksize=32),
-                            total=num_windows, desc="Spectrograms"))
+                            total=num_windows, desc="Features"))
 
     for win_idx, spec in results:
         chunks[win_idx] = spec
@@ -228,16 +229,16 @@ def load_dataset(dataset_dir="dataset"):
 # --- CLI: generate + verify ---
 if __name__ == "__main__":
 
-    total_duration = 50000
+    total_duration = 15000
     chunks_path, labels_path = generate_dataset(
         total_duration_seconds=total_duration,
-        num_sounds=int(total_duration * 1.5),
+        num_sounds=int(total_duration * 0.7),
         update_interval_ms=3000,
         seed=42,
     )
 
     chunks = np.load(chunks_path)
     labels = np.load(labels_path)
-    print(f"\nChunks: {chunks.shape}")   # (num_windows, 2, 128, T)
-    print(f"Labels: {labels.shape}")     # (num_windows, 72, 20)
+    print(f"\nChunks: {chunks.shape}")   # (num_windows, 7, 1025, T)
+    print(f"Labels: {labels.shape}")     # (num_windows, 36, 5)
     print(f"Label range: [{labels.min():.4f}, {labels.max():.4f}]")
