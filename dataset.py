@@ -187,9 +187,11 @@ def load_dataset(dataset_dir="dataset"):
 
 # --- CLI: generate + verify ---
 if __name__ == "__main__":
+
+    total_duration = 500
     chunks_path, labels_path = generate_dataset(
-        total_duration_seconds=60,
-        num_sounds=100,
+        total_duration_seconds=total_duration,
+        num_sounds=int(total_duration * 1.5),
         update_interval_ms=100,
         seed=42,
     )

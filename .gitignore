@@ -12,3 +12,4 @@ wheels/
 output/*
 dataset/*
 uv.lock
+model.pt
