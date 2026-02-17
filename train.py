@@ -5,11 +5,12 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import random
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 from main import SpatialAudioHeatmapLocator
 from convert_wav import NUM_FEATURE_CHANNELS
-from dataset import load_dataset
+from dataset import generate_epoch
 
 
 def focal_dice_loss(pred_logits, target, alpha=0.75, gamma=2.0, dice_weight=0.5):
@@ -38,11 +39,7 @@ def focal_dice_loss(pred_logits, target, alpha=0.75, gamma=2.0, dice_weight=0.5)
 
 
 class LiveComparisonPlot:
-    """Persistent matplotlib window that updates GT vs Predicted each epoch.
-
-    Runs on the main thread — call .update() after each validation step.
-    Uses fig.clf() + full redraw to avoid colorbar bugs on polar axes.
-    """
+    """Persistent matplotlib window that updates GT vs Predicted each epoch."""
 
     def __init__(self):
         plt.ion()
@@ -61,7 +58,6 @@ class LiveComparisonPlot:
 
         vmin, vmax = 0.0, max(gt.max(), pred_prob.max())
 
-        # Full clear + redraw (avoids colorbar removal issues)
         self._fig.clf()
 
         ax_gt = self._fig.add_subplot(1, 2, 1, projection="polar")
@@ -83,46 +79,52 @@ class LiveComparisonPlot:
         plt.pause(0.01)
 
 
-def train(dataset_dir="dataset",
-          epochs=100,
-          batch_size=8,
+def train(epochs=100,
+          batch_size=16,
           lr=1e-4,
           azi_bins=36,
           dist_bins=5,
+          epoch_duration_seconds=5000,
           device=None):
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # --- 1. Load dataset ---
-    chunks, labels = load_dataset(dataset_dir)
-    num_samples = chunks.shape[0]
-    print(f"Loaded {num_samples} samples — chunks {chunks.shape}, labels {labels.shape}")
-
-    # Convert to tensors
-    chunks_t = torch.from_numpy(chunks)   # (N, C, F, T)
-    labels_t = torch.from_numpy(labels)   # (N, azi_bins, dist_bins)
-
-    # --- 2. Train/val split (70/30) — sequential, no shuffle ---
-    split = int(num_samples * 0.7)
-
-    train_chunks, train_labels = chunks_t[:split], labels_t[:split]
-    val_chunks, val_labels = chunks_t[split:], labels_t[split:]
-    print(f"Train: {len(train_chunks)}  Val: {len(val_chunks)}")
-
-    # --- 3. Model, optimizer ---
+    # --- Model, optimizer ---
     model = SpatialAudioHeatmapLocator(
         input_channels=NUM_FEATURE_CHANNELS, azi_bins=azi_bins, dist_bins=dist_bins
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    # --- Live plot (persistent window, main thread) ---
+    # --- Live plot ---
     live_plot = LiveComparisonPlot()
 
-    # --- 4. Training loop ---
+    # --- Prefetch helper ---
+    num_sounds = int(epoch_duration_seconds * 0.7)
+    gen_kwargs = dict(total_duration_seconds=epoch_duration_seconds,
+                      num_sounds=num_sounds, update_interval_ms=3000)
+
+    prefetch = ThreadPoolExecutor(max_workers=1)
+
+    # Kick off first epoch generation (blocks until ready)
+    tqdm.write(f"Generating first epoch data ({epoch_duration_seconds}s, {num_sounds} sounds)…")
+    next_train_future = prefetch.submit(generate_epoch, **gen_kwargs)
+
+    # --- Training loop ---
     for epoch in tqdm(range(epochs), desc="Epochs"):
-        # Shuffle train set
+
+        # Wait for this epoch's data
+        train_chunks, train_labels = next_train_future.result()
+        train_chunks = torch.from_numpy(train_chunks)
+        train_labels = torch.from_numpy(train_labels)
+        tqdm.write(f"\n--- Epoch {epoch+1}: {len(train_chunks)} train samples ready")
+
+        # Prefetch NEXT epoch's data while we train
+        if epoch + 1 < epochs:
+            next_train_future = prefetch.submit(generate_epoch, **gen_kwargs)
+
+        # Shuffle
         perm = torch.randperm(len(train_chunks))
         train_chunks = train_chunks[perm]
         train_labels = train_labels[perm]
@@ -150,44 +152,17 @@ def train(dataset_dir="dataset",
             train_batches += 1
             batch_bar.set_postfix(loss=f"{loss.item():.6f}")
 
-        # --- Validate ---
-        model.eval()
-        val_loss = 0.0
-        val_batches = 0
-
-        # Shuffle val set
-        perm = torch.randperm(len(val_chunks))
-        val_chunks = val_chunks[perm]
-        val_labels = val_labels[perm]
-
-        with torch.no_grad():
-            for start in range(0, len(val_chunks), batch_size):
-                end = min(start + batch_size, len(val_chunks))
-                x = val_chunks[start:end].to(device)
-                y = val_labels[start:end].to(device)
-
-                pred = model(x)
-                loss = focal_dice_loss(pred, y)
-
-                val_loss += loss.item()
-                val_batches += 1
+            # Update live plot with last sample of this batch
+            live_plot.update(
+                y[-1].cpu().numpy(),
+                pred[-1].detach().cpu().numpy(),
+                epoch + 1,
+            )
 
         avg_train = train_loss / train_batches
-        avg_val = val_loss / val_batches
-        tqdm.write(f"Epoch {epoch+1:3d}/{epochs}  "
-                   f"train_loss={avg_train:.6f}  val_loss={avg_val:.6f}")
+        tqdm.write(f"Epoch {epoch+1:3d}/{epochs}  train_loss={avg_train:.6f}")
 
-        # --- Update live plot (non-blocking, main thread) ---
-        idx = random.randint(0, len(val_chunks) - 1)
-        with torch.no_grad():
-            sample_pred = model(val_chunks[idx].unsqueeze(0).to(device))
-        live_plot.update(
-            val_labels[idx].numpy(),
-            sample_pred.squeeze(0).cpu().numpy(),
-            epoch + 1,
-        )
-
-    # --- 5. Save model ---
+    # --- Save model ---
     save_path = "model.pt"
     torch.save(model.state_dict(), save_path)
     print(f"\nSaved model to {save_path}")
@@ -195,3 +170,4 @@ def train(dataset_dir="dataset",
 
 if __name__ == "__main__":
     train()
+

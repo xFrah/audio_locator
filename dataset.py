@@ -79,44 +79,44 @@ def _compute_spectrogram(args):
     return win_idx, features
 
 
-def generate_dataset(total_duration_seconds=300,
-                     num_sounds=50,
-                     window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS,
-                     update_interval_ms=100,
-                     sr=DEFAULT_SAMPLE_RATE,
-                     n_mels=DEFAULT_N_MELS,
-                     n_fft=DEFAULT_N_FFT,
-                     hop_length=DEFAULT_HOP_LENGTH,
-                     azi_bins=36,
-                     dist_bins=5,
-                     max_distance=3.0,
-                     sigma=1.2,
-                     sounds_dir=r"sounds\sounds",
-                     output_dir="dataset",
-                     num_workers=14,
-                     seed=None):
-    """Generate audio in memory, slice into windows, compute mel spectrograms,
-    and save chunks + labels as .npy. Uses multiprocessing for speed.
+# --- Collect wav files once (cached at module level) ---
+_wav_cache = {}
+
+
+def _get_wav_files(sounds_dir):
+    if sounds_dir not in _wav_cache:
+        wav_files = glob.glob(os.path.join(sounds_dir, "**", "*.wav"), recursive=True)
+        assert len(wav_files) > 0, f"No .wav files found in {sounds_dir}"
+        _wav_cache[sounds_dir] = wav_files
+    return _wav_cache[sounds_dir]
+
+
+def generate_epoch(total_duration_seconds=300,
+                   num_sounds=50,
+                   window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS,
+                   update_interval_ms=100,
+                   sr=DEFAULT_SAMPLE_RATE,
+                   n_mels=DEFAULT_N_MELS,
+                   n_fft=DEFAULT_N_FFT,
+                   hop_length=DEFAULT_HOP_LENGTH,
+                   azi_bins=36,
+                   dist_bins=5,
+                   max_distance=3.0,
+                   sigma=1.2,
+                   sounds_dir=r"sounds\sounds",
+                   num_workers=14):
+    """Generate a fresh random dataset in memory.
 
     Returns:
-        chunks_path: Path to saved spectrograms .npy — shape (num_windows, 2, n_mels, T).
-        labels_path: Path to saved labels .npy — shape (num_windows, azi_bins, dist_bins).
+        chunks: np.ndarray of shape (num_windows, 7, F_max, T)
+        labels: np.ndarray of shape (num_windows, azi_bins, dist_bins)
     """
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-
     if num_workers is None:
         num_workers = max(1, os.cpu_count() - 1)
 
-    os.makedirs(output_dir, exist_ok=True)
+    wav_files = _get_wav_files(sounds_dir)
 
-    # --- 1. Collect all source sounds ---
-    wav_files = glob.glob(os.path.join(sounds_dir, "**", "*.wav"), recursive=True)
-    assert len(wav_files) > 0, f"No .wav files found in {sounds_dir}"
-    print(f"Found {len(wav_files)} source sounds, using {num_workers} workers")
-
-    # --- 2. Prepare spatialization jobs ---
+    # --- 1. Prepare spatialization jobs ---
     total_samples = int(total_duration_seconds * sr)
 
     jobs = []
@@ -124,19 +124,17 @@ def generate_dataset(total_duration_seconds=300,
         wav_path = random.choice(wav_files)
         azi_deg = random.uniform(0, 360)
         dist_m = random.uniform(0.3, max_distance)
-        # Estimate start_sample (conservative: assume max 5s sound)
         max_start = max(0, total_samples - int(5 * sr))
         start_sample = random.randint(0, max_start)
         jobs.append((wav_path, azi_deg, dist_m, start_sample, total_samples, sr))
 
-    # --- 3. Spatialize in parallel ---
-    print(f"Spatializing {num_sounds} sounds...")
+    # --- 2. Spatialize in parallel ---
     stereo_buffer = np.zeros((2, total_samples), dtype=np.float64)
     events = []
 
     with ProcessPoolExecutor(max_workers=num_workers) as pool:
         results = list(tqdm(pool.map(_spatialize_sound, jobs),
-                            total=len(jobs), desc="HRTF"))
+                            total=len(jobs), desc="HRTF", leave=False))
 
     for result in results:
         if result is None:
@@ -145,31 +143,25 @@ def generate_dataset(total_duration_seconds=300,
         stereo_buffer[:, start_sample:end_sample] += spatial_data
         events.append((start_sample, end_sample, azi_deg, dist_m))
 
-    print(f"Placed {len(events)}/{num_sounds} sounds")
-
     # Normalize
     peak = np.max(np.abs(stereo_buffer))
     if peak > 0:
         stereo_buffer = stereo_buffer / peak * 0.9
 
-    # --- 4. Compute spatial features in parallel ---
+    # --- 3. Compute spatial features in parallel ---
     window_samples = int(window_size_seconds * sr)
     hop_samples = int(sr * update_interval_ms / 1000)
-    assert window_samples >= hop_samples, (
-        f"Window ({window_size_seconds}s) must be >= hop ({update_interval_ms}ms)")
+    assert window_samples >= hop_samples
 
     num_windows = (total_samples - window_samples) // hop_samples + 1
-    print(f"\nComputing spatial features for {num_windows} windows...")
 
     n_gcc_bins = DEFAULT_GCC_MAX_TAU
-    F_max = n_fft // 2 + 1  # 1025
+    F_max = n_fft // 2 + 1
 
-    # Pre-compute T from a dummy STFT
     dummy_stft = librosa.stft(np.zeros(window_samples, dtype=np.float32),
                               n_fft=n_fft, hop_length=hop_length)
     T = dummy_stft.shape[1]
 
-    # Build spectrogram jobs
     spec_jobs = []
     for win_idx in range(num_windows):
         win_start = win_idx * hop_samples
@@ -181,13 +173,12 @@ def generate_dataset(total_duration_seconds=300,
 
     with ProcessPoolExecutor(max_workers=num_workers) as pool:
         results = list(tqdm(pool.map(_compute_spectrogram, spec_jobs, chunksize=32),
-                            total=num_windows, desc="Features"))
+                            total=num_windows, desc="Features", leave=False))
 
     for win_idx, spec in results:
         chunks[win_idx] = spec
 
-    # --- 5. Labels (fast, no parallelism needed) ---
-    print("Computing labels...")
+    # --- 4. Labels ---
     labels = np.zeros((num_windows, azi_bins, dist_bins), dtype=np.float32)
 
     for win_idx in range(num_windows):
@@ -203,42 +194,16 @@ def generate_dataset(total_duration_seconds=300,
                                          azi_bins, dist_bins, sigma)
                 labels[win_idx] = np.maximum(labels[win_idx], blob)
 
-    # --- 6. Save ---
-    chunks_path = os.path.join(output_dir, "chunks.npy")
-    labels_path = os.path.join(output_dir, "labels.npy")
-    np.save(chunks_path, chunks)
-    np.save(labels_path, labels)
-    print(f"Saved chunks: {chunks_path} — shape {chunks.shape}")
-    print(f"Saved labels: {labels_path} — shape {labels.shape}")
-
-    return chunks_path, labels_path
-
-
-def load_dataset(dataset_dir="dataset"):
-    """Load pre-generated chunks and labels from disk.
-
-    Returns:
-        chunks: np.ndarray of shape (num_windows, 2, n_mels, T)
-        labels: np.ndarray of shape (num_windows, azi_bins, dist_bins)
-    """
-    chunks = np.load(os.path.join(dataset_dir, "chunks.npy"))
-    labels = np.load(os.path.join(dataset_dir, "labels.npy"))
     return chunks, labels
 
 
-# --- CLI: generate + verify ---
+# --- CLI: quick test ---
 if __name__ == "__main__":
-
-    total_duration = 15000
-    chunks_path, labels_path = generate_dataset(
-        total_duration_seconds=total_duration,
-        num_sounds=int(total_duration * 0.7),
+    chunks, labels = generate_epoch(
+        total_duration_seconds=60,
+        num_sounds=30,
         update_interval_ms=3000,
-        seed=42,
     )
-
-    chunks = np.load(chunks_path)
-    labels = np.load(labels_path)
-    print(f"\nChunks: {chunks.shape}")   # (num_windows, 7, 1025, T)
-    print(f"Labels: {labels.shape}")     # (num_windows, 36, 5)
+    print(f"Chunks: {chunks.shape}")   # (num_windows, 7, 1025, T)
+    print(f"Labels: {labels.shape}")   # (num_windows, 36, 5)
     print(f"Label range: [{labels.min():.4f}, {labels.max():.4f}]")
