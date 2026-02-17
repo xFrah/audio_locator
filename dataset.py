@@ -4,6 +4,8 @@ import random
 import numpy as np
 import slab
 import librosa
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
 
 from convert_wav import (
     DEFAULT_SAMPLE_RATE, DEFAULT_N_FFT, DEFAULT_HOP_LENGTH,
@@ -18,13 +20,63 @@ def _gaussian_heatmap(target_azi_idx, target_dist_idx,
     dist_range = np.arange(dist_bins, dtype=np.float32)
     azi_grid, dist_grid = np.meshgrid(azi_range, dist_range, indexing="ij")
 
-    # Circular distance for azimuth
     d_azi = np.minimum(np.abs(azi_grid - target_azi_idx),
                        azi_bins - np.abs(azi_grid - target_azi_idx))
     d_dist = np.abs(dist_grid - target_dist_idx)
 
     heatmap = np.exp(-(d_azi**2 + d_dist**2) / (2 * sigma**2))
     return heatmap / heatmap.max()
+
+
+# --- Worker functions for multiprocessing ---
+
+def _spatialize_sound(args):
+    """Worker: load, spatialize, and return result as numpy array."""
+    wav_path, azi_deg, dist_m, start_sample, total_samples, sr = args
+    room_size = [10, 10, 3]
+    listener_pos = [5, 5, 1.5]
+
+    try:
+        dry_sound = slab.Sound.read(wav_path)
+    except Exception:
+        return None
+
+    # Truncate if sound is longer than the buffer
+    if dry_sound.n_samples > total_samples:
+        dry_sound = dry_sound.resize(total_samples)
+
+    room = slab.Room(size=room_size, listener=listener_pos)
+    room.set_source([azi_deg, 0, dist_m])
+    hrir = room.hrir()
+
+    if dry_sound.samplerate != hrir.samplerate:
+        dry_sound = dry_sound.resample(hrir.samplerate)
+
+    spatial_audio = hrir.apply(dry_sound)
+
+    if spatial_audio.samplerate != sr:
+        spatial_audio = spatial_audio.resample(sr)
+
+    end_sample = min(start_sample + spatial_audio.n_samples, total_samples)
+    length = end_sample - start_sample
+    spatial_data = spatial_audio.data[:length].T  # (2, length)
+
+    return (start_sample, end_sample, azi_deg, dist_m, spatial_data)
+
+
+def _compute_spectrogram(args):
+    """Worker: compute mel spectrogram for one window."""
+    win_idx, audio_chunk_ch0, audio_chunk_ch1, sr, n_mels, n_fft, hop_length = args
+
+    specs = []
+    for ch_data in [audio_chunk_ch0, audio_chunk_ch1]:
+        S = librosa.feature.melspectrogram(
+            y=ch_data.astype(np.float32), sr=sr,
+            n_mels=n_mels, n_fft=n_fft, hop_length=hop_length
+        )
+        specs.append(librosa.power_to_db(S, ref=np.max))
+
+    return win_idx, np.stack(specs)  # (2, n_mels, T)
 
 
 def generate_dataset(total_duration_seconds=300,
@@ -41,9 +93,10 @@ def generate_dataset(total_duration_seconds=300,
                      sigma=1.2,
                      sounds_dir=r"sounds\sounds",
                      output_dir="dataset",
+                     num_workers=None,
                      seed=None):
     """Generate audio in memory, slice into windows, compute mel spectrograms,
-    and save chunks + labels as .npy.
+    and save chunks + labels as .npy. Uses multiprocessing for speed.
 
     Returns:
         chunks_path: Path to saved spectrograms .npy — shape (num_windows, 2, n_mels, T).
@@ -53,107 +106,93 @@ def generate_dataset(total_duration_seconds=300,
         random.seed(seed)
         np.random.seed(seed)
 
+    if num_workers is None:
+        num_workers = max(1, os.cpu_count() - 1)
+
     os.makedirs(output_dir, exist_ok=True)
 
     # --- 1. Collect all source sounds ---
     wav_files = glob.glob(os.path.join(sounds_dir, "**", "*.wav"), recursive=True)
     assert len(wav_files) > 0, f"No .wav files found in {sounds_dir}"
-    print(f"Found {len(wav_files)} source sounds")
+    print(f"Found {len(wav_files)} source sounds, using {num_workers} workers")
 
-    # --- 2. Setup slab environment ---
-    room_size = [10, 10, 3]
-    listener_pos = [5, 5, 1.5]
-
+    # --- 2. Prepare spatialization jobs ---
     total_samples = int(total_duration_seconds * sr)
-    stereo_buffer = np.zeros((2, total_samples), dtype=np.float64)
 
-    # --- 3. Place sounds and record events ---
-    events = []
-
+    jobs = []
     for i in range(num_sounds):
         wav_path = random.choice(wav_files)
-        try:
-            dry_sound = slab.Sound.read(wav_path)
-        except Exception as e:
-            print(f"  Skipping {wav_path}: {e}")
-            continue
-
-        # Random spatial position
         azi_deg = random.uniform(0, 360)
         dist_m = random.uniform(0.3, max_distance)
+        # Estimate start_sample (conservative: assume max 5s sound)
+        max_start = max(0, total_samples - int(5 * sr))
+        start_sample = random.randint(0, max_start)
+        jobs.append((wav_path, azi_deg, dist_m, start_sample, total_samples, sr))
 
-        # Random start time (ensure it fits)
-        dry_samples = dry_sound.n_samples
-        max_start = total_samples - dry_samples
-        if max_start <= 0:
-            dry_sound = dry_sound.resize(total_samples)
-            dry_samples = total_samples
-            max_start = 0
+    # --- 3. Spatialize in parallel ---
+    print(f"Spatializing {num_sounds} sounds...")
+    stereo_buffer = np.zeros((2, total_samples), dtype=np.float64)
+    events = []
 
-        start_sample = random.randint(0, max(0, max_start))
+    with ProcessPoolExecutor(max_workers=num_workers) as pool:
+        results = list(tqdm(pool.map(_spatialize_sound, jobs),
+                            total=len(jobs), desc="HRTF"))
 
-        # Spatialize using slab Room + HRTF
-        room = slab.Room(size=room_size, listener=listener_pos)
-        room.set_source([azi_deg, 0, dist_m])
-        hrir = room.hrir()
-
-        if dry_sound.samplerate != hrir.samplerate:
-            dry_sound = dry_sound.resample(hrir.samplerate)
-
-        spatial_audio = hrir.apply(dry_sound)
-
-        if spatial_audio.samplerate != sr:
-            spatial_audio = spatial_audio.resample(sr)
-
-        # Mix into the buffer
-        end_sample = min(start_sample + spatial_audio.n_samples, total_samples)
-        length = end_sample - start_sample
-        spatial_data = spatial_audio.data[:length].T  # (2, length)
+    for result in results:
+        if result is None:
+            continue
+        start_sample, end_sample, azi_deg, dist_m, spatial_data = result
         stereo_buffer[:, start_sample:end_sample] += spatial_data
-
         events.append((start_sample, end_sample, azi_deg, dist_m))
-        print(f"  [{i+1}/{num_sounds}] azi={azi_deg:.1f}° dist={dist_m:.2f}m "
-              f"t={start_sample/sr:.2f}-{end_sample/sr:.2f}s")
 
-    # Normalize to prevent clipping
+    print(f"Placed {len(events)}/{num_sounds} sounds")
+
+    # Normalize
     peak = np.max(np.abs(stereo_buffer))
     if peak > 0:
         stereo_buffer = stereo_buffer / peak * 0.9
 
-    # --- 4. Slice into windows and compute spectrograms + labels ---
+    # --- 4. Compute spectrograms in parallel ---
     window_samples = int(window_size_seconds * sr)
     hop_samples = int(sr * update_interval_ms / 1000)
     assert window_samples >= hop_samples, (
         f"Window ({window_size_seconds}s) must be >= hop ({update_interval_ms}ms)")
 
     num_windows = (total_samples - window_samples) // hop_samples + 1
-    print(f"\nSlicing into {num_windows} windows ({window_size_seconds}s each, "
-          f"{update_interval_ms}ms hop)...")
+    print(f"\nComputing spectrograms for {num_windows} windows...")
 
-    # Pre-compute T for the spectrogram shape
+    # Pre-compute T
     dummy_spec = librosa.feature.melspectrogram(
         y=np.zeros(window_samples, dtype=np.float32), sr=sr,
         n_mels=n_mels, n_fft=n_fft, hop_length=hop_length
     )
     T = dummy_spec.shape[1]
 
+    # Build spectrogram jobs
+    spec_jobs = []
+    for win_idx in range(num_windows):
+        win_start = win_idx * hop_samples
+        win_end = win_start + window_samples
+        chunk = stereo_buffer[:, win_start:win_end]
+        spec_jobs.append((win_idx, chunk[0], chunk[1], sr, n_mels, n_fft, hop_length))
+
     chunks = np.zeros((num_windows, 2, n_mels, T), dtype=np.float32)
+
+    with ProcessPoolExecutor(max_workers=num_workers) as pool:
+        results = list(tqdm(pool.map(_compute_spectrogram, spec_jobs, chunksize=32),
+                            total=num_windows, desc="Spectrograms"))
+
+    for win_idx, spec in results:
+        chunks[win_idx] = spec
+
+    # --- 5. Labels (fast, no parallelism needed) ---
+    print("Computing labels...")
     labels = np.zeros((num_windows, azi_bins, dist_bins), dtype=np.float32)
 
     for win_idx in range(num_windows):
         win_start = win_idx * hop_samples
         win_end = win_start + window_samples
-        audio_chunk = stereo_buffer[:, win_start:win_end]
 
-        # Mel spectrogram per channel
-        for ch in range(2):
-            S = librosa.feature.melspectrogram(
-                y=audio_chunk[ch].astype(np.float32), sr=sr,
-                n_mels=n_mels, n_fft=n_fft, hop_length=hop_length
-            )
-            chunks[win_idx, ch] = librosa.power_to_db(S, ref=np.max)
-
-        # Label: combine gaussian blobs for all active events
         for (ev_start, ev_end, azi_deg, dist_m) in events:
             if ev_start < win_end and ev_end > win_start:
                 azi_idx = round(azi_deg / 360 * azi_bins) % azi_bins
@@ -163,7 +202,7 @@ def generate_dataset(total_duration_seconds=300,
                                          azi_bins, dist_bins, sigma)
                 labels[win_idx] = np.maximum(labels[win_idx], blob)
 
-    # --- 5. Save ---
+    # --- 6. Save ---
     chunks_path = os.path.join(output_dir, "chunks.npy")
     labels_path = os.path.join(output_dir, "labels.npy")
     np.save(chunks_path, chunks)
@@ -172,6 +211,7 @@ def generate_dataset(total_duration_seconds=300,
     print(f"Saved labels: {labels_path} — shape {labels.shape}")
 
     return chunks_path, labels_path
+
 
 def load_dataset(dataset_dir="dataset"):
     """Load pre-generated chunks and labels from disk.
@@ -188,11 +228,11 @@ def load_dataset(dataset_dir="dataset"):
 # --- CLI: generate + verify ---
 if __name__ == "__main__":
 
-    total_duration = 500
+    total_duration = 50000
     chunks_path, labels_path = generate_dataset(
         total_duration_seconds=total_duration,
         num_sounds=int(total_duration * 1.5),
-        update_interval_ms=100,
+        update_interval_ms=3000,
         seed=42,
     )
 
