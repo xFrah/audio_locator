@@ -91,7 +91,7 @@ def train(epochs=100,
     # --- Data generation config ---
     num_sounds = int(epoch_duration_seconds * 1)
     gen_kwargs = dict(total_duration_seconds=epoch_duration_seconds,
-                      num_sounds=num_sounds, update_interval_ms=2000)
+                      num_sounds=num_sounds, update_interval_ms=2000, max_velocity=90, moving_prob=0.8)
 
     # --- Training loop ---
     best_loss = float('inf')

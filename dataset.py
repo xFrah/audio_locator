@@ -121,6 +121,15 @@ def precompute_hrir_grid(azi_step=1, dist_steps=None, max_distance=3.0,
 
 def _lookup_hrir(azi_deg, dist_m, azi_step=1, dist_steps=None, max_distance=3.0):
     """Find nearest cached HRIR for given azimuth and distance."""
+    global _hrir_cache
+    if not _hrir_cache:
+        # Reload cache in worker process
+        if os.path.exists(HRIR_CACHE_PATH):
+            with open(HRIR_CACHE_PATH, "rb") as f:
+                _hrir_cache = pickle.load(f)
+        else:
+            raise RuntimeError("HRIR cache not found in worker process. Ensure precompute_hrir_grid() ran in main process.")
+
     if dist_steps is None:
         dist_steps = np.linspace(0.3, max_distance, 10)
 
@@ -131,6 +140,14 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=1, dist_steps=None, max_distance=3.0)
     dist_snapped = round(float(dist_steps[np.argmin(np.abs(dist_steps - dist_m))]), 2)
 
     return _hrir_cache[(azi_snapped, dist_snapped)]
+
+
+def _get_interpolated_hrir(azi_deg, dist_m, max_distance=3.0):
+    """Get HRIR, supporting float queries by snapping (nearest neighbor for now)."""
+    # In the future, we could bilinearly interpolate between grid points.
+    # For now, nearest neighbor is sufficient if the grid is fine enough (1 deg).
+    return _lookup_hrir(azi_deg, dist_m, max_distance=max_distance)
+
 
 
 # ============================================================
@@ -159,7 +176,7 @@ def _compute_spectrogram(args):
 
 def _spatialize_sound(args):
     """Worker: convolve mono sound with HRIR and add to shared memory buffer."""
-    (idx, wav_path, azi_deg, dist_m, max_distance,
+    (idx, wav_path, start_azi, start_dist, end_azi, end_dist, max_distance,
      start_sample, shm_name, buf_shape, seed) = args
 
     # Reseed to ensure different randomness if needed (though we pass explicit params here)
@@ -192,18 +209,55 @@ def _spatialize_sound(args):
     # OR: Pass the specific mono audio array and HRIR filters in args?
     # Mono audio is small (<1MB). HRIR is tiny. Passing them in args is fine!
 
-    dry_mono, hrir_L, hrir_R = wav_path  # We'll pass actual data in args to avoid cache issues
+    dry_mono = wav_path  # args can contain the data directly
+    n_samples = len(dry_mono)
 
-    # 2. Convolve
-    spatial_L = fftconvolve(dry_mono, hrir_L, mode="full")
-    spatial_R = fftconvolve(dry_mono, hrir_R, mode="full")
+    # Check if stationary (or close enough)
+    is_stationary = (abs(start_azi - end_azi) < 0.5) and (abs(start_dist - end_dist) < 0.1)
 
-    # 3. Add to shared memory (atomic add is hard, but we can write to our specific slice?
-    # No, sounds overlap! We cannot write to shared memory safely in parallel if they overlap.
-    #
-    # CRITICAL: If sounds overlap, multiple workers writing to same RAM = race condition.
-    # Solution: Workers return the spatialized segment, Main thread adds to buffer.
-    # This keeps heavy convolution in parallel, lightweight addition in main.
+    if is_stationary:
+        # --- Fast Path: Static Convolution ---
+        hrir_L, hrir_R = _lookup_hrir(start_azi, start_dist, max_distance=max_distance)
+        spatial_L = fftconvolve(dry_mono, hrir_L, mode="full")
+        spatial_R = fftconvolve(dry_mono, hrir_R, mode="full")
+    
+    else:
+        # --- Dynamic Path: Block-based Overlap-Add ---
+        block_size = 2048
+        # HRIR length (assumed constant)
+        dummy_L, _ = _lookup_hrir(0, 1.0, max_distance=max_distance)
+        hrir_len = len(dummy_L)
+        
+        out_len = n_samples + hrir_len - 1
+        spatial_L = np.zeros(out_len, dtype=np.float32)
+        spatial_R = np.zeros(out_len, dtype=np.float32)
+
+        for b_start in range(0, n_samples, block_size):
+            b_end = min(b_start + block_size, n_samples)
+            block = dry_mono[b_start:b_end]
+            
+            # Calculate position at center of block
+            # (Simple linear interpolation over time)
+            t_center = (b_start + b_end) / 2 / n_samples
+            curr_azi = start_azi + (end_azi - start_azi) * t_center
+            curr_dist = start_dist + (end_dist - start_dist) * t_center
+            
+            # Lookup HRIR for this block
+            h_L, h_R = _get_interpolated_hrir(curr_azi, curr_dist, max_distance=max_distance)
+            
+            # Convolve
+            # mode='full' gives length N + M - 1
+            conv_L = fftconvolve(block, h_L, mode="full")
+            conv_R = fftconvolve(block, h_R, mode="full")
+            
+            # Overlap-add
+            l_conv = len(conv_L)
+            target_end = min(b_start + l_conv, len(spatial_L))
+            write_len = target_end - b_start
+            
+            if write_len > 0:
+                spatial_L[b_start : target_end] += conv_L[:write_len]
+                spatial_R[b_start : target_end] += conv_R[:write_len]
 
     return idx, start_sample, spatial_L, spatial_R
 
@@ -229,9 +283,11 @@ def generate_epoch(total_duration_seconds=300,
                    hop_length=DEFAULT_HOP_LENGTH,
                    azi_bins=180,
                    max_distance=3.0,
-                   sigma=10.0,
+                   sigma=15.0,
                    sounds_dir=r"sounds\sounds",
-                   num_workers=14):
+                   num_workers=14,
+                   moving_prob=0.5,       # Probability that a sound moves
+                   max_velocity=90.0):    # Max velocity in degrees/second
     """Generate a fresh random dataset in memory using cached HRIRs and audio.
 
     Returns:
@@ -310,17 +366,41 @@ def generate_epoch(total_duration_seconds=300,
             max_start = max(0, total_samples - int(5 * sr))
             start_sample = random.randint(0, max_start)
 
+            # Retrieve data in main thread
             try:
-                # Retrieve data in main thread
                 dry_mono = _audio_cache[wav_path]
-                hrir_L, hrir_R = _lookup_hrir(azi_deg, dist_m, max_distance=max_distance)
+                duration_sec = len(dry_mono) / sr
+                
+                # Movement logic
+                start_azi = random.uniform(0, 360)
+                start_dist = random.uniform(0.3, max_distance)
+                
+                if random.random() < moving_prob and duration_sec > 0.5:
+                    # Moving sound
+                    velocity = random.uniform(-max_velocity, max_velocity)
+                    delta_azi = velocity * duration_sec
+                    end_azi = start_azi + delta_azi
+                    # Keep distance constant for now (or vary it slightly)
+                    end_dist = start_dist 
+                else:
+                    # Static sound
+                    end_azi = start_azi
+                    end_dist = start_dist
 
-                # Pack job
-                spat_jobs.append((i, (dry_mono, hrir_L, hrir_R), azi_deg, dist_m, max_distance,
+                # Pack job (removed hrir_L/R from args, worker looks them up)
+                spat_jobs.append((i, dry_mono, start_azi, start_dist, end_azi, end_dist, max_distance,
                                   start_sample, _shm.name, buf_shape, random.randint(0, 999999)))
                 
-                # Store event metadata (end updated later)
-                events.append({'start': start_sample, 'azi': azi_deg, 'idx': i})
+                # Store event metadata
+                # For moving sounds, we need start/end azi to interpolate labels
+                events.append({
+                    'start_sample': start_sample,
+                    'idx': i,
+                    'start_azi': start_azi,
+                    'end_azi': end_azi,
+                    'start_dist': start_dist,
+                    'end_dist': end_dist
+                })
             except Exception:
                 continue
 
@@ -370,8 +450,8 @@ def generate_epoch(total_duration_seconds=300,
         idx = evt['idx']
         if sound_data_list[idx] is not None:
             s_L, _ = sound_data_list[idx]
-            end_sample = evt['start'] + len(s_L)
-            final_events.append((evt['start'], end_sample, evt['azi']))
+            evt['end_sample'] = evt['start_sample'] + len(s_L)
+            final_events.append(evt)
             
     events = final_events
     sound_data = sound_data_list
@@ -421,19 +501,32 @@ def generate_epoch(total_duration_seconds=300,
 
         # First pass: collect RMS of each overlapping sound in this window
         active = []  # (azi_deg, rms)
-        for ev_i, (ev_start, ev_end, azi_deg) in enumerate(events):
+        for ev in events:
+            ev_start, ev_end = ev['start_sample'], ev['end_sample']
+            
             overlap = min(ev_end, win_end) - max(ev_start, snapshot)
             if overlap >= min_overlap_samples:
-                s_L, s_R = sound_data[ev_i]
+                s_L, s_R = sound_data[ev['idx']]
                 local_start = max(0, snapshot - ev_start)
                 local_end = min(len(s_L), win_end - ev_start)
+                
                 if local_end > local_start:
                     seg = np.concatenate([s_L[local_start:local_end],
                                           s_R[local_start:local_end]])
                     rms = np.sqrt(np.mean(seg**2))
+                    
+                    # Calculate Azimuth at this specific time window
+                    # Linear interpolation based on time progress of the sound
+                    # Current time of window center relative to sound start
+                    win_center_sample = (win_start + win_end) / 2
+                    progress = (win_center_sample - ev_start) / (ev_end - ev_start)
+                    progress = np.clip(progress, 0.0, 1.0)
+                    
+                    current_azi = ev['start_azi'] + (ev['end_azi'] - ev['start_azi']) * progress
+                    
+                    active.append((current_azi, rms))
                 else:
-                    rms = 0.0
-                active.append((azi_deg, rms))
+                    pass
 
         sound_count[win_idx] = len(active)
 
