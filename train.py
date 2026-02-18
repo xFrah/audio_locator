@@ -66,7 +66,7 @@ class LiveComparisonPlot:
 
 
 def train(epochs=100,
-          batch_size=32,
+          batch_size=16,
           lr=2e-4,
           azi_bins=36,
           dist_bins=5,

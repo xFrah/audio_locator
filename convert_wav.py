@@ -3,7 +3,7 @@ import librosa
 import numpy as np
 
 # --- Shared Audio Constants ---
-DEFAULT_SAMPLE_RATE = 16000
+DEFAULT_SAMPLE_RATE = 44100
 DEFAULT_N_FFT = 2048
 DEFAULT_HOP_LENGTH = 512
 DEFAULT_N_MELS = 128
