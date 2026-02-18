@@ -46,48 +46,48 @@ class SpatialAudioHeatmapLocator(nn.Module):
             nn.ReLU(),
 
             # 129 -> 65
-            nn.Conv2d(256, 256, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            
-            # 65 -> 33
-            nn.Conv2d(256, 256, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-
-            # 33 -> 17
             nn.Conv2d(256, 512, kernel_size=3, stride=(2, 1), padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(),
+            
+            # 65 -> 33
+            nn.Conv2d(512, 1024, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(1024),
+            nn.ReLU(),
+
+            # 33 -> 17
+            nn.Conv2d(1024, 1024, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(1024),
+            nn.ReLU(),
 
             # 17 -> 9
-            nn.Conv2d(512, 512, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(512),
+            nn.Conv2d(1024, 2048, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(2048),
             nn.ReLU(),
             
             # 9 -> 5
-            nn.Conv2d(512, 512, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(512),
+            nn.Conv2d(2048, 2048, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(2048),
             nn.ReLU(),
         )
 
-        # Output shape is (B, 512, 5, T) -> Flatten freq -> (B, 2560, T)
-        rnn_input_dim = 512 * 5
+        # Output shape is (B, 2048, 5, T) -> Flatten freq -> (B, 10240, T)
+        rnn_input_dim = 2048 * 5
 
         # 2. TEMPORAL: Bidirectional GRU
-        self.rnn = nn.GRU(input_size=rnn_input_dim, hidden_size=256,
-                          num_layers=2, batch_first=True,
+        self.rnn = nn.GRU(input_size=rnn_input_dim, hidden_size=1024,
+                          num_layers=3, batch_first=True,
                           bidirectional=True, dropout=0.1)
 
         # 3. ATTENTION POOLING
-        self.attn_pool = AttentionPool(256 * 2)
+        self.attn_pool = AttentionPool(1024 * 2)
 
         # 4. AZIMUTH HEAD
         self.head = nn.Sequential(
-            nn.Linear(256 * 2, 512),
+            nn.Linear(1024 * 2, 1024),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(512, azi_bins),
+            nn.Linear(1024, azi_bins),
         )
 
     def forward(self, x):

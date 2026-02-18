@@ -94,6 +94,8 @@ def train(epochs=100,
                       num_sounds=num_sounds, update_interval_ms=2000)
 
     # --- Training loop ---
+    best_loss = float('inf')
+    
     for epoch in tqdm(range(epochs), desc="Epochs"):
 
         # Generate this epoch's data
@@ -140,12 +142,16 @@ def train(epochs=100,
 
         avg_train = train_loss / train_batches
         tqdm.write(f"Epoch {epoch+1:3d}/{epochs}  train_loss={avg_train:.6f}")
+        
+        # Save if best
+        if avg_train < best_loss:
+            best_loss = avg_train
+            save_path = "model.pt"
+            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+            torch.save(state_dict, save_path)
+            tqdm.write(f"New best loss! Saved model to {save_path}")
 
-    # --- Save model (strip DataParallel wrapper if present) ---
-    save_path = "model.pt"
-    state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-    torch.save(state_dict, save_path)
-    print(f"\nSaved model to {save_path}")
+    print(f"\nTraining complete. Best loss: {best_loss:.6f}")
 
 
 if __name__ == "__main__":
