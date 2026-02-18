@@ -28,7 +28,7 @@ class SpatialAudioHeatmapLocator(nn.Module):
         self.azi_bins = azi_bins
         self.dist_bins = dist_bins
 
-        # 1. ENCODER: deeper conv stack for 7-channel input
+        # 1. ENCODER
         self.encoder = nn.Sequential(
             nn.Conv2d(input_channels, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
@@ -50,10 +50,10 @@ class SpatialAudioHeatmapLocator(nn.Module):
                           num_layers=2, batch_first=True,
                           bidirectional=True, dropout=0.1)
 
-        # 3. ATTENTION POOLING over full sequence (replaces last-state bottleneck)
+        # 3. ATTENTION POOLING
         self.attn_pool = AttentionPool(256 * 2)
 
-        # 4. HEATMAP HEAD with hidden layer
+        # 4. HEATMAP HEAD
         self.heatmap_head = nn.Sequential(
             nn.Linear(256 * 2, 512),
             nn.ReLU(),
@@ -67,7 +67,6 @@ class SpatialAudioHeatmapLocator(nn.Module):
         x = x.squeeze(2).permute(0, 2, 1)  # (B, T, 256)
         rnn_out, _ = self.rnn(x)         # (B, T, 512)
 
-        # Attention pooling instead of last hidden state
         pooled = self.attn_pool(rnn_out)  # (B, 512)
 
         logits = self.heatmap_head(pooled)

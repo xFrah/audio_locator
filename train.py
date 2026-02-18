@@ -13,29 +13,15 @@ from convert_wav import NUM_FEATURE_CHANNELS
 from dataset import generate_epoch
 
 
-def focal_dice_loss(pred_logits, target, alpha=0.75, gamma=2.0, dice_weight=0.5):
-    """Combined focal + dice loss for sparse heatmap targets.
-
-    Focal loss downweights easy negatives (the many zeros) so the model
-    can't just predict all-zero.  Dice loss measures overlap and is
-    inherently balanced.
-    """
-    # --- Focal loss ---
-    bce = F.binary_cross_entropy_with_logits(pred_logits, target, reduction="none")
-    prob = torch.sigmoid(pred_logits)
-    p_t = prob * target + (1 - prob) * (1 - target)
-    alpha_t = alpha * target + (1 - alpha) * (1 - target)
-    focal = alpha_t * (1 - p_t) ** gamma * bce
-    focal = focal.mean()
-
-    # --- Dice loss ---
-    pred_flat = prob.view(prob.size(0), -1)
-    tgt_flat = target.view(target.size(0), -1)
-    intersection = (pred_flat * tgt_flat).sum(dim=1)
-    dice = 1 - (2 * intersection + 1) / (pred_flat.sum(dim=1) + tgt_flat.sum(dim=1) + 1)
-    dice = dice.mean()
-
-    return (1 - dice_weight) * focal + dice_weight * dice
+def bce_loss(pred_logits, target):
+    """BCE with dynamic pos_weight = N/K so predicting all-zero is not free."""
+    num_elements = target.numel()
+    num_pos = target.sum().clamp(min=1)
+    pos_weight = (num_elements / num_pos).clamp(max=100.0)  # cap to avoid explosion
+    return F.binary_cross_entropy_with_logits(
+        pred_logits, target,
+        pos_weight=pos_weight.expand_as(target),
+    )
 
 
 class LiveComparisonPlot:
@@ -56,7 +42,7 @@ class LiveComparisonPlot:
         distances = np.linspace(0, dist_bins, dist_bins)
         R, Theta = np.meshgrid(distances, azimuths)
 
-        vmin, vmax = 0.0, max(gt.max(), pred_prob.max())
+        vmin, vmax = 0.0, 1.0
 
         self._fig.clf()
 
@@ -80,15 +66,15 @@ class LiveComparisonPlot:
 
 
 def train(epochs=100,
-          batch_size=16,
-          lr=1e-4,
+          batch_size=32,
+          lr=2e-4,
           azi_bins=36,
           dist_bins=5,
           epoch_duration_seconds=5000,
           device=None):
 
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda:1" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
     # --- Model, optimizer ---
@@ -101,9 +87,9 @@ def train(epochs=100,
     live_plot = LiveComparisonPlot()
 
     # --- Prefetch helper ---
-    num_sounds = int(epoch_duration_seconds * 0.7)
+    num_sounds = int(epoch_duration_seconds * 1)
     gen_kwargs = dict(total_duration_seconds=epoch_duration_seconds,
-                      num_sounds=num_sounds, update_interval_ms=3000)
+                      num_sounds=num_sounds, update_interval_ms=2000)
 
     prefetch = ThreadPoolExecutor(max_workers=1)
 
@@ -142,7 +128,7 @@ def train(epochs=100,
             y = train_labels[start:end].to(device)
 
             pred = model(x)
-            loss = focal_dice_loss(pred, y)
+            loss = bce_loss(pred, y)
 
             optimizer.zero_grad()
             loss.backward()
