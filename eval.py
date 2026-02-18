@@ -13,8 +13,7 @@ from dataset import generate_epoch
 
 def evaluate(model_path="model.pt",
              test_duration=300,
-             azi_bins=36,
-             dist_bins=5,
+             azi_bins=180,
              device=None):
 
     if device is None:
@@ -23,7 +22,7 @@ def evaluate(model_path="model.pt",
 
     # Load model
     model = SpatialAudioHeatmapLocator(
-        input_channels=NUM_FEATURE_CHANNELS, azi_bins=azi_bins, dist_bins=dist_bins
+        input_channels=NUM_FEATURE_CHANNELS, azi_bins=azi_bins
     ).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -35,7 +34,7 @@ def evaluate(model_path="model.pt",
     chunks, labels = generate_epoch(
         total_duration_seconds=test_duration,
         num_sounds=num_sounds,
-        update_interval_ms=3000,
+        update_interval_ms=2000,
     )
     chunks = torch.from_numpy(chunks)
     labels_np = labels
@@ -45,9 +44,8 @@ def evaluate(model_path="model.pt",
     plt.ion()
     fig = plt.figure(figsize=(14, 6))
 
-    azimuths = np.linspace(0, 2 * np.pi, azi_bins)
-    distances = np.linspace(0, dist_bins, dist_bins)
-    R, Theta = np.meshgrid(distances, azimuths)
+    azimuths = np.linspace(0, 2 * np.pi, azi_bins, endpoint=False)
+    width = 2 * np.pi / azi_bins
 
     idx = 0
     order = np.random.permutation(len(chunks))
@@ -68,12 +66,13 @@ def evaluate(model_path="model.pt",
 
         for ax, data, label in [(ax_gt, gt, "Ground Truth"),
                                 (ax_pred, pred_prob, "Predicted")]:
-            pc = ax.pcolormesh(Theta, R, data, shading="auto", cmap="magma",
-                               vmin=0.0, vmax=1.0)
+            colors = plt.cm.magma(data)
+            ax.bar(azimuths, np.ones_like(data), width=width, bottom=0.0,
+                   color=colors, alpha=0.9)
+            ax.set_ylim(0, 1)
             ax.set_theta_zero_location("N")
             ax.set_theta_direction(-1)
             ax.set_title(label, fontsize=13, pad=12)
-            fig.colorbar(pc, ax=ax, label="Probability", shrink=0.8)
 
         fig.suptitle(f"Sample {sample_idx} ({i+1}/{len(chunks)})", fontsize=15)
         fig.tight_layout()

@@ -23,10 +23,9 @@ class AttentionPool(nn.Module):
 
 
 class SpatialAudioHeatmapLocator(nn.Module):
-    def __init__(self, input_channels=NUM_FEATURE_CHANNELS, azi_bins=36, dist_bins=5):
+    def __init__(self, input_channels=NUM_FEATURE_CHANNELS, azi_bins=180):
         super().__init__()
         self.azi_bins = azi_bins
-        self.dist_bins = dist_bins
 
         # 1. ENCODER
         self.encoder = nn.Sequential(
@@ -53,12 +52,12 @@ class SpatialAudioHeatmapLocator(nn.Module):
         # 3. ATTENTION POOLING
         self.attn_pool = AttentionPool(256 * 2)
 
-        # 4. HEATMAP HEAD
-        self.heatmap_head = nn.Sequential(
+        # 4. AZIMUTH HEAD
+        self.head = nn.Sequential(
             nn.Linear(256 * 2, 512),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(512, azi_bins * dist_bins),
+            nn.Linear(512, azi_bins),
         )
 
     def forward(self, x):
@@ -69,95 +68,38 @@ class SpatialAudioHeatmapLocator(nn.Module):
 
         pooled = self.attn_pool(rnn_out)  # (B, 512)
 
-        logits = self.heatmap_head(pooled)
-        return logits.view(-1, self.azi_bins, self.dist_bins)
+        logits = self.head(pooled)
+        return logits  # (B, azi_bins)
 
-def visualize_heatmap(heatmap_tensor, title="3D Audio Heatmap"):
+def visualize_azimuth(logits_tensor, title="Azimuth Prediction"):
     """
-    heatmap_tensor: torch.Tensor of shape (azi_bins, dist_bins)
+    logits_tensor: torch.Tensor of shape (azi_bins,)
     """
-    # Convert to numpy for plotting
-    data = torch.sigmoid(heatmap_tensor).detach().cpu().numpy()
-    
-    azi_bins, dist_bins = data.shape
-    
-    # Create coordinate grids
-    # Azimuth: 0 to 2*pi
-    # Distance: 0 to max_bins
-    azimuths = np.linspace(0, 2 * np.pi, azi_bins)
-    distances = np.linspace(0, dist_bins, dist_bins)
-    
-    R, Theta = np.meshgrid(distances, azimuths)
+    data = torch.sigmoid(logits_tensor).detach().cpu().numpy()
+    azi_bins = data.shape[0]
+    azimuths = np.linspace(0, 2 * np.pi, azi_bins, endpoint=False)
 
-    # Plotting
     fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(8, 8))
-    
-    # pcolormesh creates the "Heat" map
-    pc = ax.pcolormesh(Theta, R, data, shading='auto', cmap='magma')
-    
-    ax.set_theta_zero_location("N") # 0 degrees at the top
-    ax.set_theta_direction(-1)     # Clockwise
-    
-    plt.colorbar(pc, ax=ax, label='Probability Intensity')
+    width = 2 * np.pi / azi_bins
+    ax.bar(azimuths, data, width=width, bottom=0.0, color=plt.cm.magma(data), alpha=0.9)
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
     plt.title(title)
     plt.show()
-
-# --- 2D GAUSSIAN SMOOTHING ---
-
-
-def get_2d_gaussian_heatmap(target_azi_idx, target_dist_idx, azi_bins=36, dist_bins=5, sigma=1.2):
-    """Creates a 2D 'blob' of probability on the radar map."""
-    azi_range = torch.arange(azi_bins).float()
-    dist_range = torch.arange(dist_bins).float()
-
-    # Grid of coordinates
-    azi_grid, dist_grid = torch.meshgrid(azi_range, dist_range, indexing="ij")
-
-    # Calculate distance from target (Circular for Azimuth)
-    d_azi = torch.min(torch.abs(azi_grid - target_azi_idx), azi_bins - torch.abs(azi_grid - target_azi_idx))
-    d_dist = torch.abs(dist_grid - target_dist_idx)
-
-    # 2D Gaussian formula
-    heatmap = torch.exp(-(d_azi**2 + d_dist**2) / (2 * sigma**2))
-    return heatmap / heatmap.max()
-
-
-def heatmap_loss(pred_heatmap, target_sources, azi_bins=36, dist_bins=5):
-    """
-    target_sources: List of (azi_idx, dist_idx) for one batch item
-    This allows training with multiple sources in the same clip.
-    """
-    batch_size = pred_heatmap.size(0)
-    total_loss = 0
-
-    for i in range(batch_size):
-        # Build the ground truth heatmap by combining blobs for each source
-        gt_heatmap = torch.zeros(azi_bins, dist_bins).to(pred_heatmap.device)
-        for azi_idx, dist_idx in target_sources[i]:
-            blob = get_2d_gaussian_heatmap(azi_idx, dist_idx, azi_bins, dist_bins)
-            gt_heatmap = torch.max(gt_heatmap, blob.to(pred_heatmap.device))
-
-        total_loss += F.binary_cross_entropy_with_logits(pred_heatmap[i], gt_heatmap)
-
-    return total_loss / batch_size
 
 
 # --- RUNTIME EXAMPLE ---
 
 if __name__ == "__main__":
-    # 1. Initialize with random weights
-    model = SpatialAudioHeatmapLocator(input_channels=NUM_FEATURE_CHANNELS, azi_bins=36, dist_bins=5)
-    
-    # 2. Load real audio
+    model = SpatialAudioHeatmapLocator(input_channels=NUM_FEATURE_CHANNELS, azi_bins=180)
+
     real_audio = prepare_audio_input_librosa(r"output\gunshot_azi75_dist1.wav")
-    print(f"Input shape: {real_audio.shape}")  # [1, 7, 1025, T]
+    print(f"Input shape: {real_audio.shape}")
 
     print("Running forward pass...")
-    # 3. Model Inference
     model.eval()
     with torch.no_grad():
-        raw_output = model(real_audio)  # Output shape: (1, 36, 5)
-    
-    # 4. Strip the batch dimension and visualize
+        raw_output = model(real_audio)  # Output shape: (1, 36)
+
     print("Visualizing raw (untrained) weights...")
-    visualize_heatmap(raw_output.squeeze(0))
+    visualize_azimuth(raw_output.squeeze(0))

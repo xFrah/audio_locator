@@ -19,18 +19,12 @@ from convert_wav import (
 slab.set_default_samplerate(DEFAULT_SAMPLE_RATE)
 
 
-def _gaussian_heatmap(target_azi_idx, target_dist_idx,
-                      azi_bins=36, dist_bins=5, sigma=1.2):
-    """Creates a 2D gaussian blob on the heatmap grid (numpy version)."""
+def _gaussian_heatmap_1d(target_azi_idx, azi_bins=180, sigma=8.0):
+    """Creates a 1D circular gaussian blob on the azimuth axis."""
     azi_range = np.arange(azi_bins, dtype=np.float32)
-    dist_range = np.arange(dist_bins, dtype=np.float32)
-    azi_grid, dist_grid = np.meshgrid(azi_range, dist_range, indexing="ij")
-
-    d_azi = np.minimum(np.abs(azi_grid - target_azi_idx),
-                       azi_bins - np.abs(azi_grid - target_azi_idx))
-    d_dist = np.abs(dist_grid - target_dist_idx)
-
-    heatmap = np.exp(-(d_azi**2 + d_dist**2) / (2 * sigma**2))
+    d_azi = np.minimum(np.abs(azi_range - target_azi_idx),
+                       azi_bins - np.abs(azi_range - target_azi_idx))
+    heatmap = np.exp(-(d_azi**2) / (2 * sigma**2))
     return heatmap / heatmap.max()
 
 
@@ -168,17 +162,16 @@ def generate_epoch(total_duration_seconds=300,
                    n_mels=DEFAULT_N_MELS,
                    n_fft=DEFAULT_N_FFT,
                    hop_length=DEFAULT_HOP_LENGTH,
-                   azi_bins=36,
-                   dist_bins=5,
+                   azi_bins=180,
                    max_distance=3.0,
-                   sigma=1.1,
+                   sigma=10.0,
                    sounds_dir=r"sounds\sounds",
                    num_workers=14):
     """Generate a fresh random dataset in memory using cached HRIRs and audio.
 
     Returns:
         chunks: np.ndarray of shape (num_windows, 7, F_max, T)
-        labels: np.ndarray of shape (num_windows, azi_bins, dist_bins)
+        labels: np.ndarray of shape (num_windows, azi_bins)
     """
     if num_workers is None:
         num_workers = max(1, os.cpu_count() - 1)
@@ -194,13 +187,13 @@ def generate_epoch(total_duration_seconds=300,
     # --- 1. Spatialize using cached HRIRs (main thread, fast) ---
     total_samples = int(total_duration_seconds * sr)
     stereo_buffer = np.zeros((2, total_samples), dtype=np.float64)
-    events = []      # (start, end, azi_deg, dist_m)
+    events = []      # (start, end, azi_deg)
     sound_data = []   # per-sound spatialized arrays for intensity measurement
 
     for i in range(num_sounds):
         wav_path = random.choice(wav_files)
         azi_deg = random.uniform(0, 360)
-        dist_m = random.uniform(0.3, max_distance)
+        dist_m = random.uniform(0.3, max_distance)  # still used for realistic HRIR
         max_start = max(0, total_samples - int(5 * sr))
         start_sample = random.randint(0, max_start)
 
@@ -217,7 +210,7 @@ def generate_epoch(total_duration_seconds=300,
         length = end_sample - start_sample
         stereo_buffer[0, start_sample:end_sample] += spatial_L[:length]
         stereo_buffer[1, start_sample:end_sample] += spatial_R[:length]
-        events.append((start_sample, end_sample, azi_deg, dist_m))
+        events.append((start_sample, end_sample, azi_deg))
         sound_data.append((spatial_L[:length], spatial_R[:length]))
 
     # Normalize
@@ -259,7 +252,8 @@ def generate_epoch(total_duration_seconds=300,
     tolerance_samples = int(0.2 * sr)
     min_overlap_samples = int(0.07 * sr)
 
-    labels = np.zeros((num_windows, azi_bins, dist_bins), dtype=np.float32)
+    labels = np.zeros((num_windows, azi_bins), dtype=np.float32)
+    sound_count = np.zeros(num_windows, dtype=np.int32)
 
     for win_idx in range(num_windows):
         win_start = win_idx * hop_samples
@@ -267,8 +261,8 @@ def generate_epoch(total_duration_seconds=300,
         snapshot = win_end - tolerance_samples
 
         # First pass: collect RMS of each overlapping sound in this window
-        active = []  # (ev_i, azi_deg, dist_m, rms)
-        for ev_i, (ev_start, ev_end, azi_deg, dist_m) in enumerate(events):
+        active = []  # (azi_deg, rms)
+        for ev_i, (ev_start, ev_end, azi_deg) in enumerate(events):
             overlap = min(ev_end, win_end) - max(ev_start, snapshot)
             if overlap >= min_overlap_samples:
                 s_L, s_R = sound_data[ev_i]
@@ -280,27 +274,26 @@ def generate_epoch(total_duration_seconds=300,
                     rms = np.sqrt(np.mean(seg**2))
                 else:
                     rms = 0.0
-                active.append((azi_deg, dist_m, rms))
+                active.append((azi_deg, rms))
+
+        sound_count[win_idx] = len(active)
 
         if not active:
             continue
 
         # Normalize against loudest sound in THIS window
-        max_rms = max(r for _, _, r in active)
+        max_rms = max(r for _, r in active)
 
-        for azi_deg, dist_m, rms in active:
+        for azi_deg, rms in active:
             intensity = 0.5 + 0.5 * min(rms / (max_rms + 1e-8), 1.0)
             azi_idx = round(azi_deg / 360 * azi_bins) % azi_bins
-            dist_idx = min(round(dist_m / max_distance * (dist_bins - 1)),
-                           dist_bins - 1)
-            blob = _gaussian_heatmap(azi_idx, dist_idx,
-                                     azi_bins, dist_bins, sigma)
+            blob = _gaussian_heatmap_1d(azi_idx, azi_bins, sigma)
             labels[win_idx] = np.maximum(labels[win_idx], blob * intensity)
 
-    # Filter out windows with no active sounds
-    non_empty = labels.reshape(num_windows, -1).max(axis=1) > 0
-    chunks = chunks[non_empty]
-    labels = labels[non_empty]
+    # Keep only windows with exactly 1 active sound
+    single_source = sound_count == 1
+    chunks = chunks[single_source]
+    labels = labels[single_source]
 
     return chunks, labels
 

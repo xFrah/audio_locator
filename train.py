@@ -37,12 +37,9 @@ class LiveComparisonPlot:
     def update(self, gt, pred_logits, epoch):
         pred_prob = 1.0 / (1.0 + np.exp(-pred_logits))
 
-        azi_bins, dist_bins = gt.shape
-        azimuths = np.linspace(0, 2 * np.pi, azi_bins)
-        distances = np.linspace(0, dist_bins, dist_bins)
-        R, Theta = np.meshgrid(distances, azimuths)
-
-        vmin, vmax = 0.0, 1.0
+        azi_bins = gt.shape[0]
+        azimuths = np.linspace(0, 2 * np.pi, azi_bins, endpoint=False)
+        width = 2 * np.pi / azi_bins
 
         self._fig.clf()
 
@@ -51,14 +48,15 @@ class LiveComparisonPlot:
 
         for ax, data, label in [(ax_gt, gt, "Ground Truth"),
                                 (ax_pred, pred_prob, "Predicted")]:
-            pc = ax.pcolormesh(Theta, R, data, shading="auto", cmap="magma",
-                               vmin=vmin, vmax=vmax)
+            colors = plt.cm.magma(data)
+            ax.bar(azimuths, np.ones_like(data), width=width, bottom=0.0,
+                   color=colors, alpha=0.9)
+            ax.set_ylim(0, 1)
             ax.set_theta_zero_location("N")
             ax.set_theta_direction(-1)
             ax.set_title(label, fontsize=13, pad=12)
-            self._fig.colorbar(pc, ax=ax, label="Probability", shrink=0.8)
 
-        self._fig.suptitle(f"Epoch {epoch} — Random Val Sample", fontsize=15)
+        self._fig.suptitle(f"Epoch {epoch} — Sample", fontsize=15)
         self._fig.tight_layout()
         self._fig.canvas.draw_idle()
         self._fig.canvas.flush_events()
@@ -68,8 +66,7 @@ class LiveComparisonPlot:
 def train(epochs=100,
           batch_size=16,
           lr=2e-4,
-          azi_bins=36,
-          dist_bins=5,
+          azi_bins=180,
           epoch_duration_seconds=5000,
           device=None):
 
@@ -79,7 +76,7 @@ def train(epochs=100,
 
     # --- Model, optimizer ---
     model = SpatialAudioHeatmapLocator(
-        input_channels=NUM_FEATURE_CHANNELS, azi_bins=azi_bins, dist_bins=dist_bins
+        input_channels=NUM_FEATURE_CHANNELS, azi_bins=azi_bins
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
