@@ -28,24 +28,54 @@ class SpatialAudioHeatmapLocator(nn.Module):
         self.azi_bins = azi_bins
 
         # 1. ENCODER
+        # Input: (B, 5, 1025, T)
         self.encoder = nn.Sequential(
-            nn.Conv2d(input_channels, 64, kernel_size=3, padding=1),
+            # 1025 -> 513
+            nn.Conv2d(input_channels, 64, kernel_size=3, stride=(2, 1), padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+
+            # 513 -> 257 
+            nn.Conv2d(64, 128, kernel_size=3, stride=(2, 1), padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
+
+            # 257 -> 129
             nn.Conv2d(128, 256, kernel_size=3, stride=(2, 1), padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
+
+            # 129 -> 65
             nn.Conv2d(256, 256, kernel_size=3, stride=(2, 1), padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, None)),  # Collapse freq → 1, keep time
+            
+            # 65 -> 33
+            nn.Conv2d(256, 256, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+
+            # 33 -> 17
+            nn.Conv2d(256, 512, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+
+            # 17 -> 9
+            nn.Conv2d(512, 512, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            
+            # 9 -> 5
+            nn.Conv2d(512, 512, kernel_size=3, stride=(2, 1), padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
         )
 
+        # Output shape is (B, 512, 5, T) -> Flatten freq -> (B, 2560, T)
+        rnn_input_dim = 512 * 5
+
         # 2. TEMPORAL: Bidirectional GRU
-        self.rnn = nn.GRU(input_size=256, hidden_size=256,
+        self.rnn = nn.GRU(input_size=rnn_input_dim, hidden_size=256,
                           num_layers=2, batch_first=True,
                           bidirectional=True, dropout=0.1)
 
@@ -62,8 +92,13 @@ class SpatialAudioHeatmapLocator(nn.Module):
 
     def forward(self, x):
         # x: (B, C, F, T)
-        x = self.encoder(x)              # (B, 256, 1, T)
-        x = x.squeeze(2).permute(0, 2, 1)  # (B, T, 256)
+        x = self.encoder(x)              # (B, 512, 5, T)
+        
+        # Merge Channel and Freq dimensions
+        B, C, F, T = x.shape
+        x = x.permute(0, 3, 1, 2)        # (B, T, C, F)
+        x = x.reshape(B, T, C * F)       # (B, T, 2560)
+        
         rnn_out, _ = self.rnn(x)         # (B, T, 512)
 
         pooled = self.attn_pool(rnn_out)  # (B, 512)
@@ -93,13 +128,16 @@ def visualize_azimuth(logits_tensor, title="Azimuth Prediction"):
 if __name__ == "__main__":
     model = SpatialAudioHeatmapLocator(input_channels=NUM_FEATURE_CHANNELS, azi_bins=180)
 
-    real_audio = prepare_audio_input_librosa(r"output\gunshot_azi75_dist1.wav")
-    print(f"Input shape: {real_audio.shape}")
+    # Use dummy input instead of loading missing file
+    # Input shape: (Batch, Channels, Freq, Time)
+    dummy_input = torch.randn(1, NUM_FEATURE_CHANNELS, 1025, 431) 
+    print(f"Dummy input shape: {dummy_input.shape}")
 
     print("Running forward pass...")
     model.eval()
     with torch.no_grad():
-        raw_output = model(real_audio)  # Output shape: (1, 36)
+        raw_output = model(dummy_input)  # Output shape: (1, 36)
 
+    print(f"Output shape: {raw_output.shape}")
     print("Visualizing raw (untrained) weights...")
     visualize_azimuth(raw_output.squeeze(0))
