@@ -5,7 +5,6 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import random
-from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 from main import SpatialAudioHeatmapLocator
@@ -64,48 +63,45 @@ class LiveComparisonPlot:
 
 
 def train(epochs=100,
-          batch_size=16,
+          batch_size=32,
           lr=2e-4,
           azi_bins=180,
           epoch_duration_seconds=5000,
           device=None):
 
     if device is None:
-        device = "cuda:1" if torch.cuda.is_available() else "cpu"
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
     # --- Model, optimizer ---
     model = SpatialAudioHeatmapLocator(
         input_channels=NUM_FEATURE_CHANNELS, azi_bins=azi_bins
     ).to(device)
+
+    # Use DataParallel if multiple GPUs are available
+    if torch.cuda.device_count() > 1:
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     # --- Live plot ---
     live_plot = LiveComparisonPlot()
 
-    # --- Prefetch helper ---
+    # --- Data generation config ---
     num_sounds = int(epoch_duration_seconds * 1)
     gen_kwargs = dict(total_duration_seconds=epoch_duration_seconds,
                       num_sounds=num_sounds, update_interval_ms=2000)
 
-    prefetch = ThreadPoolExecutor(max_workers=1)
-
-    # Kick off first epoch generation (blocks until ready)
-    tqdm.write(f"Generating first epoch data ({epoch_duration_seconds}s, {num_sounds} sounds)…")
-    next_train_future = prefetch.submit(generate_epoch, **gen_kwargs)
-
     # --- Training loop ---
     for epoch in tqdm(range(epochs), desc="Epochs"):
 
-        # Wait for this epoch's data
-        train_chunks, train_labels = next_train_future.result()
+        # Generate this epoch's data
+        tqdm.write(f"\nGenerating epoch {epoch+1} data ({epoch_duration_seconds}s, {num_sounds} sounds)…")
+        train_chunks, train_labels = generate_epoch(**gen_kwargs)
         train_chunks = torch.from_numpy(train_chunks)
         train_labels = torch.from_numpy(train_labels)
-        tqdm.write(f"\n--- Epoch {epoch+1}: {len(train_chunks)} train samples ready")
-
-        # Prefetch NEXT epoch's data while we train
-        if epoch + 1 < epochs:
-            next_train_future = prefetch.submit(generate_epoch, **gen_kwargs)
+        tqdm.write(f"--- Epoch {epoch+1}: {len(train_chunks)} train samples ready")
 
         # Shuffle
         perm = torch.randperm(len(train_chunks))
@@ -145,9 +141,10 @@ def train(epochs=100,
         avg_train = train_loss / train_batches
         tqdm.write(f"Epoch {epoch+1:3d}/{epochs}  train_loss={avg_train:.6f}")
 
-    # --- Save model ---
+    # --- Save model (strip DataParallel wrapper if present) ---
     save_path = "model.pt"
-    torch.save(model.state_dict(), save_path)
+    state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+    torch.save(state_dict, save_path)
     print(f"\nSaved model to {save_path}")
 
 

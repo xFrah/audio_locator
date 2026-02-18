@@ -5,13 +5,14 @@ import pickle
 import numpy as np
 import slab
 import librosa
+from multiprocessing import shared_memory
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 from scipy.signal import fftconvolve
 
 from convert_wav import (
     DEFAULT_SAMPLE_RATE, DEFAULT_N_FFT, DEFAULT_HOP_LENGTH,
-    DEFAULT_N_MELS, DEFAULT_WINDOW_SIZE_SECONDS, DEFAULT_GCC_MAX_TAU,
+    DEFAULT_WINDOW_SIZE_SECONDS, DEFAULT_GCC_MAX_TAU,
     DEFAULT_FREQ_BINS, NUM_FEATURE_CHANNELS, compute_spatial_features,
 )
 
@@ -137,29 +138,93 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=1, dist_steps=None, max_distance=3.0)
 # ============================================================
 
 def _compute_spectrogram(args):
-    """Worker: compute spatial features for one window."""
-    win_idx, audio_chunk_ch0, audio_chunk_ch1, sr, n_mels, n_fft, hop_length, n_gcc_bins = args
+    """Worker: compute spatial features for one window from shared memory."""
+    win_idx, win_start, win_end, shm_name, buf_shape, sr, n_fft, hop_length, n_gcc_bins = args
+
+    # Attach to shared memory and read window slice
+    shm = shared_memory.SharedMemory(name=shm_name)
+    buffer = np.ndarray(buf_shape, dtype=np.float64, buffer=shm.buf)
+    ch0 = buffer[0, win_start:win_end].astype(np.float32)
+    ch1 = buffer[1, win_start:win_end].astype(np.float32)
+    shm.close()
 
     features = compute_spatial_features(
-        audio_chunk_ch0.astype(np.float32),
-        audio_chunk_ch1.astype(np.float32),
+        ch0, ch1,
         sr=sr, n_fft=n_fft, hop_length=hop_length,
-        n_mels=n_mels, n_gcc_bins=n_gcc_bins,
-    )  # (7, F_max, T)
+        n_gcc_bins=n_gcc_bins,
+    )  # (5, F_max, T)
 
     return win_idx, features
+
+
+def _spatialize_sound(args):
+    """Worker: convolve mono sound with HRIR and add to shared memory buffer."""
+    (idx, wav_path, azi_deg, dist_m, max_distance,
+     start_sample, shm_name, buf_shape, seed) = args
+
+    # Reseed to ensure different randomness if needed (though we pass explicit params here)
+    np.random.seed(seed)
+
+    # 1. Get cached audio and HRIR (read-only from module cache)
+    # Note: _audio_cache and _hrir_cache are available because of copy-on-write fork
+    # on Linux/Mac, but on Windows we might need to reload if not using 'fork'
+    # However, for now we rely on the fact that _lookup_hrir uses the module-level _hrir_cache
+    # If _hrir_cache is empty in worker, we might need to reload it.
+    # On Windows 'spawn', module globals are re-imported.
+    # _audio_cache is populated by preload_audio, which we might need to call if empty.
+
+    # Simpler: just reload/compute HRIR here if missing is fast, but better to rely on args
+    # actually, passing large arrays in args is bad.
+    # Let's rely on _audio_cache being populated.
+    # On Windows, we need to ensure caches are ready in the worker.
+    # But since we use 'spawn', the module is imported fresh.
+    # We must explicitly reload caches in worker if they are empty?
+    # Actually, let's just use the main process for looking up arrays and pass them?
+    # No, passing 5000 arrays is slow.
+    # best way: cache is in module scope.
+    # For now, let's assume valid cache or quick reload.
+
+    # WAIT: on Windows "spawn", the new process imports the module but doesn't share global state.
+    # So _audio_cache will be EMPTY in the worker unless we populate it.
+    # Populating it takes time.
+    #
+    # ALTERNATIVE: Use the main thread for spatialization if cache sharing is hard?
+    # OR: Pass the specific mono audio array and HRIR filters in args?
+    # Mono audio is small (<1MB). HRIR is tiny. Passing them in args is fine!
+
+    dry_mono, hrir_L, hrir_R = wav_path  # We'll pass actual data in args to avoid cache issues
+
+    # 2. Convolve
+    spatial_L = fftconvolve(dry_mono, hrir_L, mode="full")
+    spatial_R = fftconvolve(dry_mono, hrir_R, mode="full")
+
+    # 3. Add to shared memory (atomic add is hard, but we can write to our specific slice?
+    # No, sounds overlap! We cannot write to shared memory safely in parallel if they overlap.
+    #
+    # CRITICAL: If sounds overlap, multiple workers writing to same RAM = race condition.
+    # Solution: Workers return the spatialized segment, Main thread adds to buffer.
+    # This keeps heavy convolution in parallel, lightweight addition in main.
+
+    return idx, start_sample, spatial_L, spatial_R
 
 
 # ============================================================
 # Main generation function
 # ============================================================
 
+_initialized = False
+_filtered_wav_files = []
+_cached_T = None
+_persistent_pool = None
+_stereo_buffer_template = None  # pre-allocated zeros buffer
+_shm = None  # persistent shared memory block
+
+
 def generate_epoch(total_duration_seconds=300,
                    num_sounds=50,
                    window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS,
                    update_interval_ms=100,
                    sr=DEFAULT_SAMPLE_RATE,
-                   n_mels=DEFAULT_N_MELS,
                    n_fft=DEFAULT_N_FFT,
                    hop_length=DEFAULT_HOP_LENGTH,
                    azi_bins=180,
@@ -170,53 +235,152 @@ def generate_epoch(total_duration_seconds=300,
     """Generate a fresh random dataset in memory using cached HRIRs and audio.
 
     Returns:
-        chunks: np.ndarray of shape (num_windows, 7, F_max, T)
+        chunks: np.ndarray of shape (num_windows, NUM_FEATURE_CHANNELS, F_max, T)
         labels: np.ndarray of shape (num_windows, azi_bins)
     """
+    global _initialized, _filtered_wav_files, _cached_T, _persistent_pool, _shm
+
     if num_workers is None:
         num_workers = max(1, os.cpu_count() - 1)
 
-    # Ensure caches are populated
-    preload_audio(sounds_dir, sr=sr)
-    precompute_hrir_grid(max_distance=max_distance)
 
-    wav_files = _get_wav_paths(sounds_dir)
-    # Filter to only files we successfully loaded
-    wav_files = [f for f in wav_files if f in _audio_cache]
 
-    # --- 1. Spatialize using cached HRIRs (main thread, fast) ---
+    # --- One-time initialization ---
+    if not _initialized:
+        preload_audio(sounds_dir, sr=sr)
+        precompute_hrir_grid(max_distance=max_distance)
+
+        wav_files = _get_wav_paths(sounds_dir)
+        _filtered_wav_files = [f for f in wav_files if f in _audio_cache]
+
+        # Precompute T (number of STFT time frames)
+        window_samples = int(window_size_seconds * sr)
+        dummy_stft = librosa.stft(np.zeros(window_samples, dtype=np.float32),
+                                  n_fft=n_fft, hop_length=hop_length)
+        _cached_T = dummy_stft.shape[1]
+
+        # Start persistent process pool
+        _persistent_pool = ProcessPoolExecutor(max_workers=num_workers)
+
+        _initialized = True
+        print(f"Initialization complete: {len(_filtered_wav_files)} audio files, T={_cached_T}")
+
+    wav_files = _filtered_wav_files
+    T = _cached_T
+
+
+    # --- Ensure shared memory block exists for this epoch size ---
     total_samples = int(total_duration_seconds * sr)
-    stereo_buffer = np.zeros((2, total_samples), dtype=np.float64)
-    events = []      # (start, end, azi_deg)
-    sound_data = []   # per-sound spatialized arrays for intensity measurement
+    buf_shape = (2, total_samples)
+    buf_nbytes = int(np.prod(buf_shape)) * 8  # float64
 
-    for i in range(num_sounds):
-        wav_path = random.choice(wav_files)
-        azi_deg = random.uniform(0, 360)
-        dist_m = random.uniform(0.3, max_distance)  # still used for realistic HRIR
-        max_start = max(0, total_samples - int(5 * sr))
-        start_sample = random.randint(0, max_start)
+    if _shm is not None:
+        try:
+            _shm.close()
+            _shm.unlink()
+        except Exception:
+            pass
+    _shm = shared_memory.SharedMemory(create=True, size=buf_nbytes)
+    stereo_buffer = np.ndarray(buf_shape, dtype=np.float64, buffer=_shm.buf)
+    stereo_buffer[:] = 0
 
-        # Get cached audio and HRIR
-        dry_mono = _audio_cache[wav_path]
-        hrir_L, hrir_R = _lookup_hrir(azi_deg, dist_m, max_distance=max_distance)
 
-        # Convolve
-        spatial_L = fftconvolve(dry_mono, hrir_L, mode="full")
-        spatial_R = fftconvolve(dry_mono, hrir_R, mode="full")
+    # --- 1. Spatialize in parallel (Batched to save RAM) ---
+    # We process sounds in batches to avoid creating a massive list of jobs that consumes RAM
+    # (15k sounds * 1MB per sound = 15GB list overhead)
+    batch_size = 1000  # Process 1000 sounds at a time
+    events = []        # (start, end, azi_deg)
+    
+    # Pre-allocate list for sound data (will be filled by index)
+    # We still need this for intensity calculation, but it stores just the small arrays
+    sound_data_list = [None] * num_sounds
 
-        # Place in buffer
-        end_sample = min(start_sample + len(spatial_L), total_samples)
-        length = end_sample - start_sample
-        stereo_buffer[0, start_sample:end_sample] += spatial_L[:length]
-        stereo_buffer[1, start_sample:end_sample] += spatial_R[:length]
-        events.append((start_sample, end_sample, azi_deg))
-        sound_data.append((spatial_L[:length], spatial_R[:length]))
+    overall_pbar = tqdm(total=num_sounds, desc="Spatializing", leave=False)
+
+    for batch_start in range(0, num_sounds, batch_size):
+        batch_end = min(batch_start + batch_size, num_sounds)
+        
+        spat_jobs = []
+        batch_indices = range(batch_start, batch_end)
+        
+        for i in batch_indices:
+            wav_path = random.choice(wav_files)
+            azi_deg = random.uniform(0, 360)
+            dist_m = random.uniform(0.3, max_distance)
+            max_start = max(0, total_samples - int(5 * sr))
+            start_sample = random.randint(0, max_start)
+
+            try:
+                # Retrieve data in main thread
+                dry_mono = _audio_cache[wav_path]
+                hrir_L, hrir_R = _lookup_hrir(azi_deg, dist_m, max_distance=max_distance)
+
+                # Pack job
+                spat_jobs.append((i, (dry_mono, hrir_L, hrir_R), azi_deg, dist_m, max_distance,
+                                  start_sample, _shm.name, buf_shape, random.randint(0, 999999)))
+                
+                # Store event metadata (end updated later)
+                events.append({'start': start_sample, 'azi': azi_deg, 'idx': i})
+            except Exception:
+                continue
+
+        if not spat_jobs:
+            continue
+
+        # Dispatch batch
+        spat_iterator = _persistent_pool.map(_spatialize_sound, spat_jobs, chunksize=10)
+
+        # Collect results
+        for i, start_sample, spatial_L, spatial_R in spat_iterator:
+            end_sample = min(start_sample + len(spatial_L), total_samples)
+            length = end_sample - start_sample
+            
+            if length > 0:
+                stereo_buffer[0, start_sample:end_sample] += spatial_L[:length]
+                stereo_buffer[1, start_sample:end_sample] += spatial_R[:length]
+                
+                # Find the event for this index and update end
+                # (Note: events list grows sequentially, so i usually matches index if no skips)
+                # But safer to just store them in a dict or update by scanning?
+                # Actually, we can just update the correct event in the 'events' list
+                # But 'events' list indices don't match 'i' if some skipped.
+                # Since we append sequentially in the job loop, the last N events correspond to this batch.
+                # Wait, 'i' is the absolute sound index.
+                # Let's just trust that we appended an event for every job.
+                
+                # Store sound data for intensity
+                sound_data_list[i] = (spatial_L[:length], spatial_R[:length])
+                
+                # Update event end sample. We can't easily find the dict in the list by 'i' efficiently.
+                # Optim: Store events in a dict temporarily?
+                pass
+            
+            overall_pbar.update(1)
+
+    overall_pbar.close()
+
+    # Re-build events list with correct end samples from sound_data_list
+    # Actually, we need 'end' for the events list.
+    # Let's fix the events list structure:
+    # We only have 'start', 'azi', 'idx' in events.
+    # We can infer 'end' from sound_data_list[idx] length.
+    
+    final_events = []
+    for evt in events:
+        idx = evt['idx']
+        if sound_data_list[idx] is not None:
+            s_L, _ = sound_data_list[idx]
+            end_sample = evt['start'] + len(s_L)
+            final_events.append((evt['start'], end_sample, evt['azi']))
+            
+    events = final_events
+    sound_data = sound_data_list
 
     # Normalize
     peak = np.max(np.abs(stereo_buffer))
     if peak > 0:
         stereo_buffer = stereo_buffer / peak * 0.9
+
 
     # --- 2. Compute spatial features in parallel ---
     window_samples = int(window_size_seconds * sr)
@@ -228,25 +392,20 @@ def generate_epoch(total_duration_seconds=300,
     n_gcc_bins = DEFAULT_GCC_MAX_TAU
     F_max = n_fft // 2 + 1
 
-    dummy_stft = librosa.stft(np.zeros(window_samples, dtype=np.float32),
-                              n_fft=n_fft, hop_length=hop_length)
-    T = dummy_stft.shape[1]
-
     spec_jobs = []
     for win_idx in range(num_windows):
         win_start = win_idx * hop_samples
         win_end = win_start + window_samples
-        chunk = stereo_buffer[:, win_start:win_end]
-        spec_jobs.append((win_idx, chunk[0], chunk[1], sr, n_mels, n_fft, hop_length, n_gcc_bins))
+        spec_jobs.append((win_idx, win_start, win_end, _shm.name, buf_shape, sr, n_fft, hop_length, n_gcc_bins))
 
     chunks = np.zeros((num_windows, NUM_FEATURE_CHANNELS, F_max, T), dtype=np.float32)
 
-    with ProcessPoolExecutor(max_workers=num_workers) as pool:
-        results = list(tqdm(pool.map(_compute_spectrogram, spec_jobs, chunksize=32),
-                            total=num_windows, desc="Features", leave=False))
+    results = tqdm(_persistent_pool.map(_compute_spectrogram, spec_jobs, chunksize=32),
+                        total=num_windows, desc="Features", leave=False)
 
     for win_idx, spec in results:
         chunks[win_idx] = spec
+
 
     # --- 3. Labels with intensity-scaled blobs ---
     tolerance_samples = int(0.2 * sr)
