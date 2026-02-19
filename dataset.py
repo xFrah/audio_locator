@@ -240,10 +240,26 @@ def _spatialize_sound(args):
             block = dry_mono[b_start:b_end]
             
             # Calculate position at center of block
-            # (Simple linear interpolation over time)
+            # (Linear interpolation in Cartesian space for straight lines)
             t_center = (b_start + b_end) / 2 / n_samples
-            curr_azi = start_azi + (end_azi - start_azi) * t_center
-            curr_dist = start_dist + (end_dist - start_dist) * t_center
+            
+            # Convert start/end to Cartesian
+            # Convention: x = d*sin(azi), y = d*cos(azi) (Clockwise from North)
+            # rad
+            sa_rad = np.radians(start_azi)
+            ea_rad = np.radians(end_azi)
+            
+            sx, sy = start_dist * np.sin(sa_rad), start_dist * np.cos(sa_rad)
+            ex, ey = end_dist * np.sin(ea_rad), end_dist * np.cos(ea_rad)
+            
+            # Interpolate
+            cur_x = sx + (ex - sx) * t_center
+            cur_y = sy + (ey - sy) * t_center
+            
+            # Convert back to Polar
+            curr_dist = np.sqrt(cur_x**2 + cur_y**2)
+            # atan2(x, y) for (sin, cos) convention
+            curr_azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
             
             # Lookup HRIR for this block
             h_L, h_R = _get_interpolated_hrir(curr_azi, curr_dist, max_distance=max_distance)
@@ -296,6 +312,7 @@ def generate_epoch(total_duration_seconds=300,
     Returns:
         chunks: np.ndarray of shape (num_windows, NUM_FEATURE_CHANNELS, F_max, T)
         labels: np.ndarray of shape (num_windows, azi_bins)
+        metadata_list: list of list of dicts (one list per window, containing metadata for active sounds)
     """
     global _initialized, _filtered_wav_files, _cached_T, _persistent_pool, _shm
 
@@ -364,8 +381,6 @@ def generate_epoch(total_duration_seconds=300,
         
         for i in batch_indices:
             wav_path = random.choice(wav_files)
-            azi_deg = random.uniform(0, 360)
-            dist_m = random.uniform(0.3, max_distance)
             max_start = max(0, total_samples - int(5 * sr))
             start_sample = random.randint(0, max_start)
 
@@ -375,18 +390,71 @@ def generate_epoch(total_duration_seconds=300,
                 duration_sec = len(dry_mono) / sr
                 
                 # Movement logic
+                # Movement logic: Vector-based
                 start_azi = random.uniform(0, 360)
-                start_dist = random.uniform(0.3, max_distance)
+                # Distance distribution: Mostly 2-4m, few near 0.
+                # Triangular distribution peaking at 3.5m (assuming max~5)
+                start_dist = random.triangular(0.5, max_distance, 3.5)
                 
+                # Convert to Cartesian
+                sa_rad = np.radians(start_azi)
+                sx = start_dist * np.sin(sa_rad)
+                sy = start_dist * np.cos(sa_rad)
+                
+                end_azi = start_azi
+                end_dist = start_dist
+
                 if random.random() < moving_prob and duration_sec > 0.5:
-                    # Moving sound
-                    velocity = random.uniform(-max_velocity, max_velocity)
-                    delta_azi = velocity * duration_sec
-                    end_azi = start_azi + delta_azi
-                    # Keep distance constant for now (or vary it slightly)
-                    end_dist = start_dist 
+                    # Random velocity vector
+                    move_heading = random.uniform(0, 360)
+                    speed = random.uniform(0.5, 3.0) # m/s (Reasonable walking/running speed)
+                    
+                    # Velocity components
+                    mh_rad = np.radians(move_heading)
+                    vx = speed * np.sin(mh_rad)
+                    vy = speed * np.cos(mh_rad)
+                    
+                    # Unclamped end pos
+                    ex = sx + vx * duration_sec
+                    ey = sy + vy * duration_sec
+                    
+                    # Clamp to max_distance
+                    # Ray-circle intersection? Or just scale vector?
+                    # Since we start inside, we just need to check if we exit.
+                    final_dist = np.sqrt(ex**2 + ey**2)
+                    
+                    if final_dist > max_distance:
+                        # We went out of bounds. Find intersection point.
+                        # We want t such that |start + v*t| = max_dist
+                        # This works, but easier approximation: just clip the end point to boundary?
+                        # No, clipping dist changes direction.
+                        # We should shorten the path so it stops AT the boundary (or bounces, but let's just stop/slide).
+                        # Let's simple clip the distance of the end point? No that warps the path.
+                        # Let's scale the vector (ex, ey) to be on the circle? No.
+                        # Correct way: find intersection of line segment with circle.
+                        # But lazy way (good enough): normalize (ex, ey) to max_dist.
+                        # This effectively makes the sound "slide" along the wall if it was going straight out,
+                        # but changes trajectory if it was tangential.
+                        #
+                        # BETTER: Scale down the displacement so it ends at boundary?
+                        # No, that changes speed.
+                        #
+                        # SIMPLEST ROBUST: If end is OOB, retry with new randoms (rejection sampling).
+                        # But that might bias towards center.
+                        #
+                        # Let's just clip the end point to max radius direction-wise from center.
+                        # This is what "scale to max_dist" means.
+                        # It changes the physical path (curves it to center), but ensures validity.
+                        scale = max_distance / final_dist
+                        ex *= scale
+                        ey *= scale
+                        final_dist = max_distance
+                        
+                    # Convert end back to polar
+                    end_dist = final_dist
+                    end_azi = np.degrees(np.arctan2(ex, ey)) % 360
                 else:
-                    # Static sound
+                    # Static
                     end_azi = start_azi
                     end_dist = start_dist
 
@@ -494,7 +562,8 @@ def generate_epoch(total_duration_seconds=300,
     rms_window_samples = int(RMS_WINDOW_DURATION * sr)
 
     labels = np.zeros((num_windows, azi_bins), dtype=np.float32)
-    # sound_count = np.zeros(num_windows, dtype=np.int32) # No longer needed for filtering
+    metadata_list = [[] for _ in range(num_windows)]
+    # sound_count = np.zeros(num_windows, dtype=np.int32) # No longer needed for filterin
 
     for win_idx in range(num_windows):
         win_start = win_idx * hop_samples
@@ -502,11 +571,21 @@ def generate_epoch(total_duration_seconds=300,
         
         # New logic: Check for sounds active at the EXACT end of the window
         active_events = []
+        min_samples = int(0.070 * sr) # 70 ms constraint
+        
         for ev in events:
             # Check if the sound covers the instant 'win_end'
             # (start < win_end <= end)
             if ev['start_sample'] < win_end <= ev['end_sample']:
-                active_events.append(ev)
+                
+                # Additional Constraint: Must appear for at least 70ms in this window
+                # Since it's active at win_end, the overlap end is win_end.
+                # Overlap start is max(win_start, ev['start_sample'])
+                overlap_start = max(win_start, ev['start_sample'])
+                duration_in_window = win_end - overlap_start
+                
+                if duration_in_window >= min_samples:
+                    active_events.append(ev)
         
         if not active_events:
             continue
@@ -529,35 +608,71 @@ def generate_epoch(total_duration_seconds=300,
                 if len(seg_L) > 0:
                     seg_rms = np.sqrt(np.mean(np.concatenate([seg_L, seg_R])**2))
                     
-                    # Calculate intensity (Absolute normalization)
-                    # 0.5 is the floor for any audible sound
-                    # 1.0 is reached at MAX_RMS_THRESHOLD
-                    normalized_rms = min(seg_rms / MAX_RMS_THRESHOLD, 1.0)
-                    intensity = 0.5 + 0.5 * normalized_rms
+                    # Calculate intensity (dB scale)
+                    # Perceived intensity is logarithmic.
+                    # Dynamic range: 60 dB
+                    eps = 1e-9
+                    ref_db = 20 * np.log10(MAX_RMS_THRESHOLD + eps)
+                    min_db = ref_db - 60.0
                     
+                    curr_db = 20 * np.log10(seg_rms + eps)
+                    curr_db = np.clip(curr_db, min_db, ref_db)
+                    
+                    # Normalize 0 (min_db) -> 1 (ref_db)
+                    normalized_db = (curr_db - min_db) / (ref_db - min_db)
+                    
+                    # Map to [0.5, 1.0]
+                    intensity = 0.5 + 0.5 * normalized_db
+                
                     # Calculate Azimuth at win_end
                     progress = (win_end - ev['start_sample']) / (ev['end_sample'] - ev['start_sample'])
                     progress = np.clip(progress, 0.0, 1.0)
-                    current_azi = ev['start_azi'] + (ev['end_azi'] - ev['start_azi']) * progress
+                    
+                    # Use Cartesian interpolation to match spatialization logic
+                    sa_rad = np.radians(ev['start_azi'])
+                    ea_rad = np.radians(ev['end_azi'])
+                    sx, sy = ev['start_dist'] * np.sin(sa_rad), ev['start_dist'] * np.cos(sa_rad)
+                    ex, ey = ev['end_dist'] * np.sin(ea_rad), ev['end_dist'] * np.cos(ea_rad)
+                    
+                    cur_x = sx + (ex - sx) * progress
+                    cur_y = sy + (ey - sy) * progress
+                    
+                    current_dist = np.sqrt(cur_x**2 + cur_y**2)
+                    current_azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
                     
                     azi_idx = round(current_azi / 360 * azi_bins) % azi_bins
                     blob = _gaussian_heatmap_1d(azi_idx, azi_bins, sigma)
                     
                     # Accumulate (max pooling)
                     labels[win_idx] = np.maximum(labels[win_idx], blob * intensity)
-
+                    
+                    # Store metadata for visualization
+                    # We want to know: ID, Trajectory (Start->End), Current Pos, Timing
+                    metadata_list[win_idx].append({
+                        'id': ev['idx'],
+                        'start_sample': ev['start_sample'],
+                        'end_sample': ev['end_sample'],
+                        'traj_start': (ev['start_azi'], ev['start_dist']),
+                        'traj_end': (ev['end_azi'], ev['end_dist']),
+                        'current_pos': (current_azi, current_dist), 
+                        'win_range': (win_start, win_end)
+                    })
+    
     # Filter out silent windows (where max label is 0)
     # We only want to train on windows that have at least one active sound
     has_active_sound = labels.max(axis=1) > 0
     chunks = chunks[has_active_sound]
     labels = labels[has_active_sound]
+    
+    # Filter metadata list
+    metadata_list = [m for i, m in enumerate(metadata_list) if has_active_sound[i]]
 
-    return chunks, labels
+    return chunks, labels, metadata_list
 
 
 # --- CLI: quick test ---
 if __name__ == "__main__":
-    chunks, labels = generate_epoch(
+    chunks, labels, meta = generate_epoch(
         total_duration_seconds=60,
         num_sounds=30,
         update_interval_ms=3000,

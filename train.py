@@ -1,8 +1,12 @@
 import torch
+import warnings
+
+# Suppress "PyTorch is not compiled with NCCL support" warning on Windows
+warnings.filterwarnings("ignore", message=".*PyTorch is not compiled with NCCL support.*")
 import torch.nn.functional as F
 import numpy as np
 import matplotlib
-matplotlib.use("TkAgg")
+# matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import random
 from tqdm import tqdm
@@ -28,12 +32,12 @@ class LiveComparisonPlot:
 
     def __init__(self):
         plt.ion()
-        self._fig = plt.figure(figsize=(14, 6))
+        self._fig = plt.figure(figsize=(14, 10))  # Taller figure for 2x2
         self._fig.suptitle("Waiting for first epoch…", fontsize=15)
         self._fig.canvas.draw()
         plt.pause(0.01)
 
-    def update(self, gt, pred_logits, epoch):
+    def update(self, gt, pred_logits, metadata, epoch):
         pred_prob = 1.0 / (1.0 + np.exp(-pred_logits))
 
         azi_bins = gt.shape[0]
@@ -42,18 +46,112 @@ class LiveComparisonPlot:
 
         self._fig.clf()
 
-        ax_gt = self._fig.add_subplot(1, 2, 1, projection="polar")
-        ax_pred = self._fig.add_subplot(1, 2, 2, projection="polar")
+        # --- 1. Ground Truth (Polar) ---
+        ax_gt = self._fig.add_subplot(2, 2, 1, projection="polar")
+        colors = plt.cm.magma(gt)
+        ax_gt.bar(azimuths, np.ones_like(gt), width=width, bottom=0.0,
+               color=colors, alpha=0.9)
+        ax_gt.set_ylim(0, 1)
+        ax_gt.set_theta_zero_location("N")
+        ax_gt.set_theta_direction(-1)
+        ax_gt.set_title("Ground Truth", fontsize=13, pad=12)
 
-        for ax, data, label in [(ax_gt, gt, "Ground Truth"),
-                                (ax_pred, pred_prob, "Predicted")]:
-            colors = plt.cm.magma(data)
-            ax.bar(azimuths, np.ones_like(data), width=width, bottom=0.0,
-                   color=colors, alpha=0.9)
-            ax.set_ylim(0, 1)
-            ax.set_theta_zero_location("N")
-            ax.set_theta_direction(-1)
-            ax.set_title(label, fontsize=13, pad=12)
+        # --- 2. Predicted (Polar) ---
+        ax_pred = self._fig.add_subplot(2, 2, 2, projection="polar")
+        colors = plt.cm.magma(pred_prob)
+        ax_pred.bar(azimuths, np.ones_like(pred_prob), width=width, bottom=0.0,
+               color=colors, alpha=0.9)
+        ax_pred.set_ylim(0, 1)
+        ax_pred.set_theta_zero_location("N")
+        ax_pred.set_theta_direction(-1)
+        ax_pred.set_title("Predicted", fontsize=13, pad=12)
+
+        # --- 3. Room Map (Cartesian) ---
+        ax_map = self._fig.add_subplot(2, 2, 3)
+        ax_map.set_title("Room Map (Top-Down)")
+        ax_map.set_xlim(-5, 5) # Assuming room size ~10m
+        ax_map.set_ylim(-5, 5)
+        ax_map.set_aspect('equal')
+        ax_map.grid(True, alpha=0.3)
+        
+        # Plot listener
+        ax_map.plot(0, 0, 'k+', markersize=10, label="Listener")
+        
+        # Plot sounds
+        for m in metadata:
+            curr_azi_rad = np.radians(m['current_pos'][0])
+            curr_x = m['current_pos'][1] * np.sin(curr_azi_rad)
+            curr_y = m['current_pos'][1] * np.cos(curr_azi_rad)
+            
+            # Check if moving (tolerance for float equality)
+            is_moving = (abs(m['traj_start'][0] - m['traj_end'][0]) > 0.1 or 
+                         abs(m['traj_start'][1] - m['traj_end'][1]) > 0.1)
+            
+            if is_moving:
+                color = 'r' # Moving = Red
+                
+                # Draw straight trajectory (Cartesian)
+                # Since movement is now linear in Cartesian space, we just draw a line.
+                
+                # Convert start/end to Cartesian for plotting
+                start_azi_rad = np.radians(m['traj_start'][0])
+                start_x = m['traj_start'][1] * np.sin(start_azi_rad)
+                start_y = m['traj_start'][1] * np.cos(start_azi_rad)
+                
+                curr_azi_rad = np.radians(m['current_pos'][0])
+                curr_x = m['current_pos'][1] * np.sin(curr_azi_rad)
+                curr_y = m['current_pos'][1] * np.cos(curr_azi_rad)
+                
+                # Draw from Start -> Current (Past only)
+                ax_map.plot([start_x, curr_x], [start_y, curr_y], '-', color=color, alpha=0.3)
+                
+            else:
+                color = 'b' # Static = Blue
+            
+            # Draw current pos
+            ax_map.plot(curr_x, curr_y, 'o', color=color)
+            ax_map.text(curr_x + 0.2, curr_y, str(m['id']), fontsize=8, color=color)
+
+        # --- 4. Timeline (Gantt) ---
+        ax_time = self._fig.add_subplot(2, 2, 4)
+        ax_time.set_title("Timeline (Relative Time [s])")
+        
+        if metadata:
+            win_start, win_end = metadata[0]['win_range']
+            sr = 44100 # Assuming default SR
+            
+            # Center view around window
+            # Window duration in samples
+            win_duration_samples = win_end - win_start
+            
+            yticks = []
+            yticklabels = []
+            
+            for i, m in enumerate(metadata):
+                y = i
+                # Convert active samples to relative time (seconds)
+                # t=0 is the start of the current window
+                start_rel_sec = (m['start_sample'] - win_start) / sr
+                end_rel_sec = (m['end_sample'] - win_start) / sr
+                duration_sec = end_rel_sec - start_rel_sec
+                
+                ax_time.barh(y, duration_sec, left=start_rel_sec, height=0.6, align='center', color='green', alpha=0.6)
+                yticks.append(y)
+                yticklabels.append(f"Sound {m['id']}")
+            
+            ax_time.set_yticks(yticks)
+            ax_time.set_yticklabels(yticklabels)
+            
+            # Highlight current window [0, win_duration_in_sec]
+            win_duration_sec = win_duration_samples / sr
+            ax_time.axvspan(0, win_duration_sec, color='red', alpha=0.1, label='Current Window')
+            ax_time.axvline(win_duration_sec, color='red', linestyle='--', label='Instant')
+            
+            # Set x-limit to show window + context
+            # Show a bit of context before and after
+            context = 1.0 # 1 second context
+            ax_time.set_xlim(-context, win_duration_sec + context)
+            ax_time.set_xlabel("Time (s) [0 = Window Start]")
 
         self._fig.suptitle(f"Epoch {epoch} — Sample", fontsize=15)
         self._fig.tight_layout()
@@ -100,7 +198,7 @@ def train(epochs=100,
 
         # Generate this epoch's data
         tqdm.write(f"\nGenerating epoch {epoch+1} data ({epoch_duration_seconds}s, {num_sounds} sounds)…")
-        train_chunks, train_labels = generate_epoch(**gen_kwargs)
+        train_chunks, train_labels, train_metadata = generate_epoch(**gen_kwargs)
         train_chunks = torch.from_numpy(train_chunks)
         train_labels = torch.from_numpy(train_labels)
         tqdm.write(f"--- Epoch {epoch+1}: {len(train_chunks)} train samples ready")
@@ -109,6 +207,7 @@ def train(epochs=100,
         perm = torch.randperm(len(train_chunks))
         train_chunks = train_chunks[perm]
         train_labels = train_labels[perm]
+        train_metadata = [train_metadata[i] for i in perm.tolist()]
 
         # --- Train ---
         model.train()
@@ -134,9 +233,11 @@ def train(epochs=100,
             batch_bar.set_postfix(loss=f"{loss.item():.6f}")
 
             # Update live plot with last sample of this batch
+            # Update every batch as requested by user
             live_plot.update(
                 y[-1].cpu().numpy(),
                 pred[-1].detach().cpu().numpy(),
+                train_metadata[end-1], # Sample metadata
                 epoch + 1,
             )
 
