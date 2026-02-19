@@ -11,7 +11,7 @@ from convert_wav import NUM_FEATURE_CHANNELS
 from dataset import generate_epoch
 
 
-def evaluate(model_path="best_model.pt",
+def evaluate(model_path="model.pt",
              test_duration=300,
              azi_bins=180,
              device=None):

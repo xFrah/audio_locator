@@ -16,6 +16,9 @@ from convert_wav import (
     DEFAULT_FREQ_BINS, NUM_FEATURE_CHANNELS, compute_spatial_features,
 )
 
+MAX_RMS_THRESHOLD = 0.15
+RMS_WINDOW_DURATION = 0.05  # 50ms for instantaneous intensity
+
 # Match slab's HRIR samplerate to our audio pipeline
 slab.set_default_samplerate(DEFAULT_SAMPLE_RATE)
 
@@ -488,64 +491,66 @@ def generate_epoch(total_duration_seconds=300,
 
 
     # --- 3. Labels with intensity-scaled blobs ---
-    tolerance_samples = int(0.2 * sr)
-    min_overlap_samples = int(0.07 * sr)
+    rms_window_samples = int(RMS_WINDOW_DURATION * sr)
 
     labels = np.zeros((num_windows, azi_bins), dtype=np.float32)
-    sound_count = np.zeros(num_windows, dtype=np.int32)
+    # sound_count = np.zeros(num_windows, dtype=np.int32) # No longer needed for filtering
 
     for win_idx in range(num_windows):
         win_start = win_idx * hop_samples
         win_end = win_start + window_samples
-        snapshot = win_end - tolerance_samples
-
-        # First pass: collect RMS of each overlapping sound in this window
-        active = []  # (azi_deg, rms)
+        
+        # New logic: Check for sounds active at the EXACT end of the window
+        active_events = []
         for ev in events:
-            ev_start, ev_end = ev['start_sample'], ev['end_sample']
-            
-            overlap = min(ev_end, win_end) - max(ev_start, snapshot)
-            if overlap >= min_overlap_samples:
-                s_L, s_R = sound_data[ev['idx']]
-                local_start = max(0, snapshot - ev_start)
-                local_end = min(len(s_L), win_end - ev_start)
-                
-                if local_end > local_start:
-                    seg = np.concatenate([s_L[local_start:local_end],
-                                          s_R[local_start:local_end]])
-                    rms = np.sqrt(np.mean(seg**2))
-                    
-                    # Calculate Azimuth at this specific time window
-                    # Linear interpolation based on time progress of the sound
-                    # Current time of window center relative to sound start
-                    win_center_sample = (win_start + win_end) / 2
-                    progress = (win_center_sample - ev_start) / (ev_end - ev_start)
-                    progress = np.clip(progress, 0.0, 1.0)
-                    
-                    current_azi = ev['start_azi'] + (ev['end_azi'] - ev['start_azi']) * progress
-                    
-                    active.append((current_azi, rms))
-                else:
-                    pass
-
-        sound_count[win_idx] = len(active)
-
-        if not active:
+            # Check if the sound covers the instant 'win_end'
+            # (start < win_end <= end)
+            if ev['start_sample'] < win_end <= ev['end_sample']:
+                active_events.append(ev)
+        
+        if not active_events:
             continue
 
-        # Normalize against loudest sound in THIS window
-        max_rms = max(r for _, r in active)
+        for ev in active_events:
+            # Calculate instantaneous RMS at win_end
+            # Extract segment ending at win_end
+            # We need to look up data in sound_data (which has the full spatialized sound)
+            s_L, s_R = sound_data[ev['idx']]
+            
+            # Map win_end to local index in the sound array
+            local_end_idx = win_end - ev['start_sample']
+            local_start_idx = max(0, local_end_idx - rms_window_samples)
+            
+            # If segment is valid
+            if local_end_idx > 0:
+                seg_L = s_L[local_start_idx : local_end_idx]
+                seg_R = s_R[local_start_idx : local_end_idx]
+                
+                if len(seg_L) > 0:
+                    seg_rms = np.sqrt(np.mean(np.concatenate([seg_L, seg_R])**2))
+                    
+                    # Calculate intensity (Absolute normalization)
+                    # 0.5 is the floor for any audible sound
+                    # 1.0 is reached at MAX_RMS_THRESHOLD
+                    normalized_rms = min(seg_rms / MAX_RMS_THRESHOLD, 1.0)
+                    intensity = 0.5 + 0.5 * normalized_rms
+                    
+                    # Calculate Azimuth at win_end
+                    progress = (win_end - ev['start_sample']) / (ev['end_sample'] - ev['start_sample'])
+                    progress = np.clip(progress, 0.0, 1.0)
+                    current_azi = ev['start_azi'] + (ev['end_azi'] - ev['start_azi']) * progress
+                    
+                    azi_idx = round(current_azi / 360 * azi_bins) % azi_bins
+                    blob = _gaussian_heatmap_1d(azi_idx, azi_bins, sigma)
+                    
+                    # Accumulate (max pooling)
+                    labels[win_idx] = np.maximum(labels[win_idx], blob * intensity)
 
-        for azi_deg, rms in active:
-            intensity = 0.5 + 0.5 * min(rms / (max_rms + 1e-8), 1.0)
-            azi_idx = round(azi_deg / 360 * azi_bins) % azi_bins
-            blob = _gaussian_heatmap_1d(azi_idx, azi_bins, sigma)
-            labels[win_idx] = np.maximum(labels[win_idx], blob * intensity)
-
-    # Keep only windows with exactly 1 active sound
-    single_source = sound_count == 1
-    chunks = chunks[single_source]
-    labels = labels[single_source]
+    # Filter out silent windows (where max label is 0)
+    # We only want to train on windows that have at least one active sound
+    has_active_sound = labels.max(axis=1) > 0
+    chunks = chunks[has_active_sound]
+    labels = labels[has_active_sound]
 
     return chunks, labels
 
