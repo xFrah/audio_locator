@@ -41,7 +41,12 @@ def _gaussian_heatmap_1d(target_azi_idx, azi_bins=180, sigma=8.0):
 
 _wav_paths_cache = {}        # sounds_dir -> list[str]
 _audio_cache = {}            # wav_path -> np.ndarray (samples,)  mono at target sr
-_hrir_cache = {}             # (azi_deg_rounded, dist_rounded) -> (hrir_L, hrir_R)  np arrays
+
+# Shared Memory for HRIRs
+HRIR_CACHE_PATH = "hrir_cache.pkl"
+_hrir_shm = None
+_hrir_shm_meta = None # dict: (azi, dist) -> (offset_L, offset_R, length)
+_hrir_shm_array = None # ndarray mapped to shared memory
 
 
 def _get_wav_paths(sounds_dir):
@@ -89,7 +94,7 @@ def _compute_hrir_worker(args):
 def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
                          room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
     """Precompute HRIRs on a grid and cache them (disk + memory)."""
-    global _hrir_cache
+    global _hrir_shm, _hrir_shm_meta, _hrir_shm_array
 
     if max_distance is None:
         # Calculate max horizontal distance from listener to the closest wall
@@ -103,60 +108,111 @@ def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
     # 360 degrees / 0.5 step = 720 azi steps
     num_azi_steps = int(360 / azi_step)
     total = num_azi_steps * len(dist_steps)
+    
+    local_cache = {}
 
     # Try loading from disk first
-    if not _hrir_cache and os.path.exists(HRIR_CACHE_PATH):
+    if os.path.exists(HRIR_CACHE_PATH):
         print(f"Loading HRIR cache from {HRIR_CACHE_PATH}...")
         with open(HRIR_CACHE_PATH, "rb") as f:
-            _hrir_cache = pickle.load(f)
-        print(f"Loaded {len(_hrir_cache)} cached HRIRs")
+            local_cache = pickle.load(f)
+        print(f"Loaded {len(local_cache)} cached HRIRs")
 
     # Check if we already have everything
     # Need to generate float sequence since range doesn't support floats
     azi_range = np.arange(0, 360, azi_step)
     already_cached = sum(1 for a in azi_range
-                         for d in dist_steps if (float(a), round(d, 2)) in _hrir_cache)
-    if already_cached == total:
-        return
-
-    print(f"Precomputing HRIR grid ({num_azi_steps} azimuths × {len(dist_steps)} distances = {total} positions)...")
-    
-    # Identify missing coordinates
-    missing_jobs = []
-    for azi_deg in azi_range:
-        for dist_m in dist_steps:
-            key = (float(azi_deg), round(dist_m, 2))
-            if key not in _hrir_cache:
-                missing_jobs.append((float(azi_deg), float(dist_m), room_size, listener_pos))
-                
-    if not missing_jobs:
-        return
+                         for d in dist_steps if (float(a), round(d, 2)) in local_cache)
+                         
+    if already_cached < total:
+        print(f"Precomputing HRIR grid ({num_azi_steps} azimuths × {len(dist_steps)} distances = {total} positions)...")
         
-    global _persistent_pool
-    results = tqdm(_persistent_pool.map(_compute_hrir_worker, missing_jobs, chunksize=50),
-                   total=len(missing_jobs), desc="Generating HRIRs", leave=False)
+        # Identify missing coordinates
+        missing_jobs = []
+        for azi_deg in azi_range:
+            for dist_m in dist_steps:
+                key = (float(azi_deg), round(dist_m, 2))
+                if key not in local_cache:
+                    missing_jobs.append((float(azi_deg), float(dist_m), room_size, listener_pos))
+                    
+        if missing_jobs:
+            global _persistent_pool
+            results = tqdm(_persistent_pool.map(_compute_hrir_worker, missing_jobs, chunksize=50),
+                           total=len(missing_jobs), desc="Generating HRIRs", leave=False)
+        
+            for azi_deg, dist_m, hrir_L, hrir_R in results:
+                local_cache[(azi_deg, dist_m)] = (hrir_L, hrir_R)
+        
+            # Save to disk
+            with open(HRIR_CACHE_PATH, "wb") as f:
+                pickle.dump(local_cache, f)
+            print(f"HRIR cache: {len(local_cache)} entries (saved to {HRIR_CACHE_PATH})")
 
-    for azi_deg, dist_m, hrir_L, hrir_R in results:
-        _hrir_cache[(azi_deg, dist_m)] = (hrir_L, hrir_R)
-
-    # Save to disk
-    with open(HRIR_CACHE_PATH, "wb") as f:
-        pickle.dump(_hrir_cache, f)
-    print(f"HRIR cache: {len(_hrir_cache)} entries (saved to {HRIR_CACHE_PATH})")
+    # Move to Shared Memory if not already initialized
+    if _hrir_shm is None and local_cache:
+        print("Setting up shared memory for HRIR cache...")
+        
+        # Determine total size needed
+        total_floats = 0
+        tap_length = 0
+        for k, (hL, hR) in local_cache.items():
+            if tap_length == 0:
+                tap_length = len(hL)
+            total_floats += len(hL) + len(hR)
+            
+        nbytes = total_floats * 4 # float32
+        
+        # Create shared memory block
+        try:
+            # Try to attach if it exists from previous crashed run
+            _hrir_shm = shared_memory.SharedMemory(name="hrir_cache_shm", create=False)
+            _hrir_shm.close()
+            _hrir_shm.unlink()
+        except FileNotFoundError:
+            pass
+            
+        _hrir_shm = shared_memory.SharedMemory(name="hrir_cache_shm", create=True, size=nbytes)
+        _hrir_shm_array = np.ndarray((total_floats,), dtype=np.float32, buffer=_hrir_shm.buf)
+        _hrir_shm_meta = {}
+        
+        offset = 0
+        for k, (hL, hR) in local_cache.items():
+            length = len(hL)
+            
+            # Write L
+            _hrir_shm_array[offset : offset + length] = hL
+            off_L = offset
+            offset += length
+            
+            # Write R
+            _hrir_shm_array[offset : offset + length] = hR
+            off_R = offset
+            offset += length
+            
+            _hrir_shm_meta[k] = (off_L, off_R, length)
+            
+        print(f"HRIR Shared Memory initialized. Size: {nbytes / 1024 / 1024:.2f} MB")
 
 
 
 def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=None,
-                 room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
+                 room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5], shm_meta=None):
     """Find nearest cached HRIR for given azimuth and distance."""
-    global _hrir_cache
-    if not _hrir_cache:
-        # Reload cache in worker process
-        if os.path.exists(HRIR_CACHE_PATH):
-            with open(HRIR_CACHE_PATH, "rb") as f:
-                _hrir_cache = pickle.load(f)
-        else:
-            raise RuntimeError("HRIR cache not found in worker process. Ensure precompute_hrir_grid() ran in main process.")
+    global _hrir_shm, _hrir_shm_array, _hrir_shm_meta
+    
+    # Worker initialization of shared memory wrapper
+    if _hrir_shm_meta is None and shm_meta is not None:
+        _hrir_shm_meta = shm_meta
+        _hrir_shm = shared_memory.SharedMemory(name="hrir_cache_shm", create=False)
+        
+        # Calculate size based on first item
+        total_floats = 0
+        for k, (off_L, off_R, length) in _hrir_shm_meta.items():
+            total_floats += 2 * length
+        _hrir_shm_array = np.ndarray((total_floats,), dtype=np.float32, buffer=_hrir_shm.buf)
+
+    if _hrir_shm_meta is None:
+        raise RuntimeError("HRIR shared memory metadata not found in worker process.")
 
     if max_distance is None:
         lx, ly, _ = listener_pos
@@ -172,15 +228,19 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=No
     # Snap distance to nearest grid point
     dist_snapped = round(float(dist_steps[np.argmin(np.abs(dist_steps - dist_m))]), 2)
 
-    return _hrir_cache[(azi_snapped, dist_snapped)]
+    off_L, off_R, length = _hrir_shm_meta[(azi_snapped, dist_snapped)]
+    hrir_L = _hrir_shm_array[off_L : off_L + length]
+    hrir_R = _hrir_shm_array[off_R : off_R + length]
+    
+    return hrir_L, hrir_R
 
 
 def _get_interpolated_hrir(azi_deg, dist_m, max_distance=None,
-                           room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
+                           room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5], shm_meta=None):
     """Get HRIR, supporting float queries by snapping (nearest neighbor for now)."""
     # In the future, we could bilinearly interpolate between grid points.
     # For now, nearest neighbor is sufficient if the grid is fine enough (1 deg).
-    return _lookup_hrir(azi_deg, dist_m, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
+    return _lookup_hrir(azi_deg, dist_m, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos, shm_meta=shm_meta)
 
 
 
@@ -211,37 +271,10 @@ def _compute_spectrogram(args):
 def _spatialize_sound(args):
     """Worker: convolve mono sound with HRIR and add to shared memory buffer."""
     (idx, wav_path, start_azi, start_dist, end_azi, end_dist, max_distance,
-     room_size, listener_pos, start_sample, shm_name, buf_shape, seed) = args
+     room_size, listener_pos, start_sample, shm_name, buf_shape, seed, hrir_shm_meta) = args
 
     # Reseed to ensure different randomness if needed (though we pass explicit params here)
     np.random.seed(seed)
-
-    # 1. Get cached audio and HRIR (read-only from module cache)
-    # Note: _audio_cache and _hrir_cache are available because of copy-on-write fork
-    # on Linux/Mac, but on Windows we might need to reload if not using 'fork'
-    # However, for now we rely on the fact that _lookup_hrir uses the module-level _hrir_cache
-    # If _hrir_cache is empty in worker, we might need to reload it.
-    # On Windows 'spawn', module globals are re-imported.
-    # _audio_cache is populated by preload_audio, which we might need to call if empty.
-
-    # Simpler: just reload/compute HRIR here if missing is fast, but better to rely on args
-    # actually, passing large arrays in args is bad.
-    # Let's rely on _audio_cache being populated.
-    # On Windows, we need to ensure caches are ready in the worker.
-    # But since we use 'spawn', the module is imported fresh.
-    # We must explicitly reload caches in worker if they are empty?
-    # Actually, let's just use the main process for looking up arrays and pass them?
-    # No, passing 5000 arrays is slow.
-    # best way: cache is in module scope.
-    # For now, let's assume valid cache or quick reload.
-
-    # WAIT: on Windows "spawn", the new process imports the module but doesn't share global state.
-    # So _audio_cache will be EMPTY in the worker unless we populate it.
-    # Populating it takes time.
-    #
-    # ALTERNATIVE: Use the main thread for spatialization if cache sharing is hard?
-    # OR: Pass the specific mono audio array and HRIR filters in args?
-    # Mono audio is small (<1MB). HRIR is tiny. Passing them in args is fine!
 
     dry_mono = wav_path  # args can contain the data directly
     n_samples = len(dry_mono)
@@ -251,7 +284,7 @@ def _spatialize_sound(args):
 
     if is_stationary:
         # --- Fast Path: Static Convolution ---
-        hrir_L, hrir_R = _lookup_hrir(start_azi, start_dist, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
+        hrir_L, hrir_R = _lookup_hrir(start_azi, start_dist, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos, shm_meta=hrir_shm_meta)
         spatial_L = fftconvolve(dry_mono, hrir_L, mode="full")
         spatial_R = fftconvolve(dry_mono, hrir_R, mode="full")
     
@@ -259,7 +292,7 @@ def _spatialize_sound(args):
         # --- Dynamic Path: Block-based Overlap-Add ---
         block_size = 2048
         # HRIR length (assumed constant)
-        dummy_L, _ = _lookup_hrir(0, 1.0, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
+        dummy_L, _ = _lookup_hrir(0, 1.0, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos, shm_meta=hrir_shm_meta)
         hrir_len = len(dummy_L)
         
         out_len = n_samples + hrir_len - 1
@@ -293,7 +326,7 @@ def _spatialize_sound(args):
             curr_azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
             
             # Lookup HRIR for this block
-            h_L, h_R = _get_interpolated_hrir(curr_azi, curr_dist, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
+            h_L, h_R = _get_interpolated_hrir(curr_azi, curr_dist, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos, shm_meta=hrir_shm_meta)
             
             # Convolve
             # mode='full' gives length N + M - 1
@@ -493,7 +526,7 @@ def generate_epoch(total_duration_seconds=300,
 
                 # Pack job (removed hrir_L/R from args, worker looks them up)
                 spat_jobs.append((i, dry_mono, start_azi, start_dist, end_azi, end_dist, max_distance,
-                                  room_size, listener_pos, start_sample, _shm.name, buf_shape, random.randint(0, 999999)))
+                                  room_size, listener_pos, start_sample, _shm.name, buf_shape, random.randint(0, 999999), _hrir_shm_meta))
                 
                 # Store event metadata
                 # For moving sounds, we need start/end azi to interpolate labels
