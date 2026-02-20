@@ -9,9 +9,10 @@ import matplotlib.pyplot as plt
 from main import SpatialAudioHeatmapLocator
 from convert_wav import NUM_FEATURE_CHANNELS
 from dataset import generate_epoch
+from train import LiveComparisonPlot
 
 
-def evaluate(model_path="model.pt",
+def evaluate(model_path="resume.pt",
              test_duration=300,
              azi_bins=180,
              device=None):
@@ -31,7 +32,7 @@ def evaluate(model_path="model.pt",
     # Generate test data
     num_sounds = int(test_duration * 1)
     print(f"Generating test data ({test_duration}s, {num_sounds} sounds)...")
-    chunks, labels = generate_epoch(
+    chunks, labels, metadata = generate_epoch(
         total_duration_seconds=test_duration,
         num_sounds=num_sounds,
         update_interval_ms=2000,
@@ -40,12 +41,8 @@ def evaluate(model_path="model.pt",
     labels_np = labels
     print(f"{len(chunks)} test samples")
 
-    # Setup plot
-    plt.ion()
-    fig = plt.figure(figsize=(14, 6))
-
-    azimuths = np.linspace(0, 2 * np.pi, azi_bins, endpoint=False)
-    width = 2 * np.pi / azi_bins
+    # Setup live plot
+    live_plot = LiveComparisonPlot()
 
     idx = 0
     order = np.random.permutation(len(chunks))
@@ -54,30 +51,13 @@ def evaluate(model_path="model.pt",
         sample_idx = order[i % len(order)]
         x = chunks[sample_idx].unsqueeze(0).to(device)
         gt = labels_np[sample_idx]
+        sample_md = metadata[sample_idx]
 
         with torch.no_grad():
             pred_logits = model(x).squeeze(0).cpu().numpy()
-        pred_prob = 1.0 / (1.0 + np.exp(-pred_logits))
-
-        fig.clf()
-
-        ax_gt = fig.add_subplot(1, 2, 1, projection="polar")
-        ax_pred = fig.add_subplot(1, 2, 2, projection="polar")
-
-        for ax, data, label in [(ax_gt, gt, "Ground Truth"),
-                                (ax_pred, pred_prob, "Predicted")]:
-            colors = plt.cm.magma(data)
-            ax.bar(azimuths, np.ones_like(data), width=width, bottom=0.0,
-                   color=colors, alpha=0.9)
-            ax.set_ylim(0, 1)
-            ax.set_theta_zero_location("N")
-            ax.set_theta_direction(-1)
-            ax.set_title(label, fontsize=13, pad=12)
-
-        fig.suptitle(f"Sample {sample_idx} ({i+1}/{len(chunks)})", fontsize=15)
-        fig.tight_layout()
-        fig.canvas.draw_idle()
-        fig.canvas.flush_events()
+            
+        # Update via LiveComparisonPlot
+        live_plot.update(gt, pred_logits, sample_md, f"Sample {sample_idx} ({i+1}/{len(chunks)})")
 
     def on_key(event):
         nonlocal idx
@@ -88,9 +68,10 @@ def evaluate(model_path="model.pt",
             idx = max(0, idx - 1)
             show_sample(idx)
         elif event.key in ("q", "escape"):
-            plt.close(fig)
+            live_plot.stop()
+            plt.close(live_plot._fig)
 
-    fig.canvas.mpl_connect("key_press_event", on_key)
+    live_plot._fig.canvas.mpl_connect("key_press_event", on_key)
 
     show_sample(0)
     print("\nControls: Right/Space = next, Left = prev, Q/Esc = quit")

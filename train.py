@@ -1,12 +1,16 @@
 import torch
 import warnings
+import os
+import threading
+import time
+import gc
 
 # Suppress "PyTorch is not compiled with NCCL support" warning on Windows
 warnings.filterwarnings("ignore", message=".*PyTorch is not compiled with NCCL support.*")
 import torch.nn.functional as F
 import numpy as np
 import matplotlib
-# matplotlib.use("TkAgg")
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import random
 from tqdm import tqdm
@@ -36,6 +40,27 @@ class LiveComparisonPlot:
         self._fig.suptitle("Waiting for first epoch…", fontsize=15)
         self._fig.canvas.draw()
         plt.pause(0.01)
+        
+        self._running = True
+        self._thread = threading.Thread(target=self._pump_loop, daemon=True)
+        self._thread.start()
+
+    def _pump_loop(self):
+        """Background thread to keep the GUI responsive."""
+        while self._running:
+            try:
+                self._fig.canvas.flush_events()
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    def stop(self):
+        self._running = False
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+            
+    def pump_events(self):
+        pass # Deprecated, handled by background thread
 
     def update(self, gt, pred_logits, metadata, epoch):
         pred_prob = 1.0 / (1.0 + np.exp(-pred_logits))
@@ -176,6 +201,11 @@ def train(epochs=100,
         input_channels=NUM_FEATURE_CHANNELS, azi_bins=azi_bins
     ).to(device)
 
+    if os.path.exists("resume.pt"):
+        print("Found resume.pt, resuming training from these weights...")
+        state_dict = torch.load("resume.pt", map_location=device, weights_only=True)
+        model.load_state_dict(state_dict)
+
     # Use DataParallel if multiple GPUs are available
     if torch.cuda.device_count() > 1:
         print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
@@ -252,6 +282,13 @@ def train(epochs=100,
             torch.save(state_dict, save_path)
             tqdm.write(f"New best loss! Saved model to {save_path}")
 
+        # --- Explicit Garbage Collection to prevent RAM spikes ---
+        del train_chunks
+        del train_labels
+        del train_metadata
+        gc.collect()
+
+    live_plot.stop()
     print(f"\nTraining complete. Best loss: {best_loss:.6f}")
 
 
