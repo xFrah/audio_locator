@@ -136,6 +136,48 @@ class LiveComparisonPlot:
             # Draw current pos
             ax_map.plot(curr_x, curr_y, 'o', color=color)
             ax_map.text(curr_x + 0.2, curr_y, str(m['id']), fontsize=8, color=color)
+            
+            # Retrieve physical sound properties
+            radius = m.get('radius', 1.0)
+            width_deg = m.get('width_deg', 0.0)
+
+            # Draw the physical radius around the sound position
+            circle = matplotlib.patches.Circle((curr_x, curr_y), radius, fill=False, color=color, alpha=0.5, linestyle='--')
+            ax_map.add_patch(circle)
+
+            # Draw the FOV projection cone from listener (0,0) to sound
+            if m['current_pos'][1] > radius:
+                # FOV bounded tightly by radius tangents
+                half_angle_rad = np.radians(width_deg / 2)
+                # left tangent
+                angle_left = curr_azi_rad - half_angle_rad
+                lx = - 10 * np.sin(angle_left) # Negative to account for clockwise from North polar standard vs standard trig
+                ly = 10 * np.cos(angle_left)
+                # right tangent
+                angle_right = curr_azi_rad + half_angle_rad
+                rx = - 10 * np.sin(angle_right)
+                ry = 10 * np.cos(angle_right)
+                
+                # We want the lines to start from (0,0) and go in the correct compass direction
+                lx = np.sin(angle_left) * m['current_pos'][1]
+                ly = np.cos(angle_left) * m['current_pos'][1]
+                rx = np.sin(angle_right) * m['current_pos'][1]
+                ry = np.cos(angle_right) * m['current_pos'][1]
+                
+                # Wait, standard math has 0 deg as North, plotting East as positive X -> sin(azi)
+                # Plot tangents extending to the source tangent touch points
+                tangent_dist = np.sqrt(m['current_pos'][1]**2 - radius**2)
+                lx_tangent = tangent_dist * np.sin(angle_left)
+                ly_tangent = tangent_dist * np.cos(angle_left)
+                rx_tangent = tangent_dist * np.sin(angle_right)
+                ry_tangent = tangent_dist * np.cos(angle_right)
+                
+                ax_map.plot([0, lx_tangent], [0, ly_tangent], color='green', alpha=0.3)
+                ax_map.plot([0, rx_tangent], [0, ry_tangent], color='green', alpha=0.3)
+                
+            else:
+                # Listener is inside the circle
+                ax_map.plot(0, 0, marker='o', markersize=30, markeredgecolor='green', markerfacecolor='none', alpha=0.3)
 
         # --- 4. Timeline (Gantt) ---
         ax_time = self._fig.add_subplot(2, 2, 4)

@@ -26,13 +26,6 @@ RMS_WINDOW_DURATION = 0.05  # 50ms for instantaneous intensity
 slab.set_default_samplerate(DEFAULT_SAMPLE_RATE)
 
 
-def _gaussian_heatmap_1d(target_azi_idx, azi_bins=180, sigma=8.0):
-    """Creates a 1D circular gaussian blob on the azimuth axis."""
-    azi_range = np.arange(azi_bins, dtype=np.float32)
-    d_azi = np.minimum(np.abs(azi_range - target_azi_idx),
-                       azi_bins - np.abs(azi_range - target_azi_idx))
-    heatmap = np.exp(-(d_azi**2) / (2 * sigma**2))
-    return heatmap / heatmap.max()
 
 
 # ============================================================
@@ -366,7 +359,6 @@ def generate_epoch(total_duration_seconds=300,
                    azi_bins=180,
                    room_size=[10.0, 10.0, 3.0],
                    listener_pos=[5.0, 5.0, 1.5],
-                   sigma=15.0,
                    sounds_dir=r"sounds\sounds",
                    num_workers=14,
                    moving_prob=0.5,       # Probability that a sound moves
@@ -673,24 +665,34 @@ def generate_epoch(total_duration_seconds=300,
                 
                 if len(seg_L) > 0:
                     seg_rms = np.sqrt(np.mean(np.concatenate([seg_L, seg_R])**2))
+                    if seg_rms < 1e-4:  # effectively silent
+                        continue
+                        
+                    # Calculate spectral centroid using slab
+                    mono_seg = (seg_L + seg_R) * 0.5
+                    # try:
+                    temp_sound = slab.Sound(data=mono_seg, samplerate=sr)
+                    centroid_feat = temp_sound.spectral_feature('centroid')
+                    centroid = float(centroid_feat[0] if isinstance(centroid_feat, (list, np.ndarray)) else centroid_feat)
+                    # except Exception:
+                    #     centroid = 1000.0
+                        
+                    # Map centroid to a physical radius (meters)
+                    # Bass (< 100 Hz) gets a large radius, high (> 4000 Hz) gets a small radius
+                    f_min = 100.0
+                    f_max = 4000.0
+                    centroid_clipped = np.clip(centroid, f_min, f_max)
+                    log_f = np.log10(centroid_clipped)
+                    log_min = np.log10(f_min)
+                    log_max = np.log10(f_max)
                     
-                    # Calculate intensity (dB scale)
-                    # Perceived intensity is logarithmic.
-                    # Dynamic range: 60 dB
-                    eps = 1e-9
-                    ref_db = 20 * np.log10(MAX_RMS_THRESHOLD + eps)
-                    min_db = ref_db - 60.0
+                    progress_f = (log_f - log_min) / (log_max - log_min)
                     
-                    curr_db = 20 * np.log10(seg_rms + eps)
-                    curr_db = np.clip(curr_db, min_db, ref_db)
-                    
-                    # Normalize 0 (min_db) -> 1 (ref_db)
-                    normalized_db = (curr_db - min_db) / (ref_db - min_db)
-                    
-                    # Map to [0.5, 1.0]
-                    intensity = 0.5 + 0.5 * normalized_db
+                    r_max = 2.5  # Max radius for bass
+                    r_min = 0.2  # Min radius for high frequencies
+                    radius = r_max - progress_f * (r_max - r_min)
                 
-                    # Calculate Azimuth at win_end
+                    # Calculate Azimuth and Distance at win_end
                     progress = (win_end - ev['start_sample']) / (ev['end_sample'] - ev['start_sample'])
                     progress = np.clip(progress, 0.0, 1.0)
                     
@@ -706,14 +708,25 @@ def generate_epoch(total_duration_seconds=300,
                     current_dist = np.sqrt(cur_x**2 + cur_y**2)
                     current_azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
                     
-                    azi_idx = round(current_azi / 360 * azi_bins) % azi_bins
-                    blob = _gaussian_heatmap_1d(azi_idx, azi_bins, sigma)
+                    # Compute angular width based on distance and radius from listener perspective
+                    if current_dist <= radius:
+                        width_deg = 180.0
+                    else:
+                        half_angle_rad = np.arcsin(radius / current_dist)
+                        width_deg = 2.0 * np.degrees(half_angle_rad)
+                        
+                    width_bins = max(1, int(round(width_deg / 360 * azi_bins)))
                     
-                    # Accumulate (max pooling)
-                    labels[win_idx] = np.maximum(labels[win_idx], blob * intensity)
+                    azi_idx = round(current_azi / 360 * azi_bins) % azi_bins
+                    
+                    # Accumulate (max pooling with 1s)
+                    half_w = width_bins // 2
+                    for offset in range(-half_w, width_bins - half_w):
+                        idx = (int(azi_idx) + offset) % azi_bins
+                        labels[win_idx, idx] = 1.0
                     
                     # Store metadata for visualization
-                    # We want to know: ID, Trajectory (Start->End), Current Pos, Timing
+                    # We want to know: ID, Trajectory (Start->End), Current Pos, Timing, Radius, Width
                     metadata_list[win_idx].append({
                         'id': ev['idx'],
                         'start_sample': ev['start_sample'],
@@ -721,7 +734,9 @@ def generate_epoch(total_duration_seconds=300,
                         'traj_start': (ev['start_azi'], ev['start_dist']),
                         'traj_end': (ev['end_azi'], ev['end_dist']),
                         'current_pos': (current_azi, current_dist), 
-                        'win_range': (win_start, win_end)
+                        'win_range': (win_start, win_end),
+                        'radius': radius,
+                        'width_deg': width_deg
                     })
     
     # Filter out silent windows (where max label is 0)
