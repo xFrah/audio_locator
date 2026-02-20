@@ -16,6 +16,9 @@ from convert_wav import (
     DEFAULT_FREQ_BINS, NUM_FEATURE_CHANNELS, compute_spatial_features,
 )
 
+# Initialize persistent pool globally using all available cores minus one
+_persistent_pool = ProcessPoolExecutor(max_workers=max(1, os.cpu_count() - 1))
+
 MAX_RMS_THRESHOLD = 0.15
 RMS_WINDOW_DURATION = 0.05  # 50ms for instantaneous intensity
 
@@ -74,20 +77,32 @@ def preload_audio(sounds_dir, sr=DEFAULT_SAMPLE_RATE):
 
 HRIR_CACHE_PATH = "hrir_cache.pkl"
 
+def _compute_hrir_worker(args):
+    """Worker: compute HRIR for a specific azimuth and distance."""
+    azi_deg, dist_m, room_size, listener_pos = args
+    room = slab.Room(size=room_size, listener=listener_pos)
+    room.set_source([float(azi_deg), 0, float(dist_m)])
+    hrir = room.hrir()
+    hrir_data = hrir.data  # (n_taps, 2)
+    return float(azi_deg), round(dist_m, 2), hrir_data[:, 0].copy(), hrir_data[:, 1].copy()
 
-def precompute_hrir_grid(azi_step=1, dist_steps=None, max_distance=3.0,
-                         room_size=None, listener_pos=None):
+def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
+                         room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
     """Precompute HRIRs on a grid and cache them (disk + memory)."""
     global _hrir_cache
 
-    if room_size is None:
-        room_size = [10, 10, 3]
-    if listener_pos is None:
-        listener_pos = [5, 5, 1.5]
+    if max_distance is None:
+        # Calculate max horizontal distance from listener to the closest wall
+        lx, ly, _ = listener_pos
+        rx, ry, _ = room_size
+        max_distance = min(lx, rx - lx, ly, ry - ly)
+    
     if dist_steps is None:
-        dist_steps = np.linspace(0.3, max_distance, 10).tolist()
+        dist_steps = np.linspace(0.3, max_distance, 40).tolist()
 
-    total = len(range(0, 360, azi_step)) * len(dist_steps)
+    # 360 degrees / 0.5 step = 720 azi steps
+    num_azi_steps = int(360 / azi_step)
+    total = num_azi_steps * len(dist_steps)
 
     # Try loading from disk first
     if not _hrir_cache and os.path.exists(HRIR_CACHE_PATH):
@@ -97,23 +112,32 @@ def precompute_hrir_grid(azi_step=1, dist_steps=None, max_distance=3.0,
         print(f"Loaded {len(_hrir_cache)} cached HRIRs")
 
     # Check if we already have everything
-    already_cached = sum(1 for a in range(0, 360, azi_step)
-                         for d in dist_steps if (a, round(d, 2)) in _hrir_cache)
+    # Need to generate float sequence since range doesn't support floats
+    azi_range = np.arange(0, 360, azi_step)
+    already_cached = sum(1 for a in azi_range
+                         for d in dist_steps if (float(a), round(d, 2)) in _hrir_cache)
     if already_cached == total:
         return
 
-    print(f"Precomputing HRIR grid ({360 // azi_step} azimuths × {len(dist_steps)} distances)...")
-    room = slab.Room(size=room_size, listener=listener_pos)
-
-    for azi_deg in tqdm(range(0, 360, azi_step), desc="HRIR grid", leave=False):
+    print(f"Precomputing HRIR grid ({num_azi_steps} azimuths × {len(dist_steps)} distances = {total} positions)...")
+    
+    # Identify missing coordinates
+    missing_jobs = []
+    for azi_deg in azi_range:
         for dist_m in dist_steps:
-            key = (azi_deg, round(dist_m, 2))
-            if key in _hrir_cache:
-                continue
-            room.set_source([float(azi_deg), 0, float(dist_m)])
-            hrir = room.hrir()
-            hrir_data = hrir.data  # (n_taps, 2)
-            _hrir_cache[key] = (hrir_data[:, 0].copy(), hrir_data[:, 1].copy())
+            key = (float(azi_deg), round(dist_m, 2))
+            if key not in _hrir_cache:
+                missing_jobs.append((float(azi_deg), float(dist_m), room_size, listener_pos))
+                
+    if not missing_jobs:
+        return
+        
+    global _persistent_pool
+    results = tqdm(_persistent_pool.map(_compute_hrir_worker, missing_jobs, chunksize=50),
+                   total=len(missing_jobs), desc="Generating HRIRs", leave=False)
+
+    for azi_deg, dist_m, hrir_L, hrir_R in results:
+        _hrir_cache[(azi_deg, dist_m)] = (hrir_L, hrir_R)
 
     # Save to disk
     with open(HRIR_CACHE_PATH, "wb") as f:
@@ -122,7 +146,8 @@ def precompute_hrir_grid(azi_step=1, dist_steps=None, max_distance=3.0,
 
 
 
-def _lookup_hrir(azi_deg, dist_m, azi_step=1, dist_steps=None, max_distance=3.0):
+def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=None,
+                 room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
     """Find nearest cached HRIR for given azimuth and distance."""
     global _hrir_cache
     if not _hrir_cache:
@@ -133,11 +158,16 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=1, dist_steps=None, max_distance=3.0)
         else:
             raise RuntimeError("HRIR cache not found in worker process. Ensure precompute_hrir_grid() ran in main process.")
 
+    if max_distance is None:
+        lx, ly, _ = listener_pos
+        rx, ry, _ = room_size
+        max_distance = min(lx, rx - lx, ly, ry - ly)
+
     if dist_steps is None:
-        dist_steps = np.linspace(0.3, max_distance, 10)
+        dist_steps = np.linspace(0.3, max_distance, 40)
 
     # Snap azimuth to nearest grid point
-    azi_snapped = round(azi_deg / azi_step) * azi_step % 360
+    azi_snapped = float(round(azi_deg / azi_step) * azi_step % 360)
 
     # Snap distance to nearest grid point
     dist_snapped = round(float(dist_steps[np.argmin(np.abs(dist_steps - dist_m))]), 2)
@@ -145,11 +175,12 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=1, dist_steps=None, max_distance=3.0)
     return _hrir_cache[(azi_snapped, dist_snapped)]
 
 
-def _get_interpolated_hrir(azi_deg, dist_m, max_distance=3.0):
+def _get_interpolated_hrir(azi_deg, dist_m, max_distance=None,
+                           room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
     """Get HRIR, supporting float queries by snapping (nearest neighbor for now)."""
     # In the future, we could bilinearly interpolate between grid points.
     # For now, nearest neighbor is sufficient if the grid is fine enough (1 deg).
-    return _lookup_hrir(azi_deg, dist_m, max_distance=max_distance)
+    return _lookup_hrir(azi_deg, dist_m, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
 
 
 
@@ -180,7 +211,7 @@ def _compute_spectrogram(args):
 def _spatialize_sound(args):
     """Worker: convolve mono sound with HRIR and add to shared memory buffer."""
     (idx, wav_path, start_azi, start_dist, end_azi, end_dist, max_distance,
-     start_sample, shm_name, buf_shape, seed) = args
+     room_size, listener_pos, start_sample, shm_name, buf_shape, seed) = args
 
     # Reseed to ensure different randomness if needed (though we pass explicit params here)
     np.random.seed(seed)
@@ -220,7 +251,7 @@ def _spatialize_sound(args):
 
     if is_stationary:
         # --- Fast Path: Static Convolution ---
-        hrir_L, hrir_R = _lookup_hrir(start_azi, start_dist, max_distance=max_distance)
+        hrir_L, hrir_R = _lookup_hrir(start_azi, start_dist, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
         spatial_L = fftconvolve(dry_mono, hrir_L, mode="full")
         spatial_R = fftconvolve(dry_mono, hrir_R, mode="full")
     
@@ -228,7 +259,7 @@ def _spatialize_sound(args):
         # --- Dynamic Path: Block-based Overlap-Add ---
         block_size = 2048
         # HRIR length (assumed constant)
-        dummy_L, _ = _lookup_hrir(0, 1.0, max_distance=max_distance)
+        dummy_L, _ = _lookup_hrir(0, 1.0, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
         hrir_len = len(dummy_L)
         
         out_len = n_samples + hrir_len - 1
@@ -262,7 +293,7 @@ def _spatialize_sound(args):
             curr_azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
             
             # Lookup HRIR for this block
-            h_L, h_R = _get_interpolated_hrir(curr_azi, curr_dist, max_distance=max_distance)
+            h_L, h_R = _get_interpolated_hrir(curr_azi, curr_dist, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
             
             # Convolve
             # mode='full' gives length N + M - 1
@@ -288,7 +319,6 @@ def _spatialize_sound(args):
 _initialized = False
 _filtered_wav_files = []
 _cached_T = None
-_persistent_pool = None
 _stereo_buffer_template = None  # pre-allocated zeros buffer
 _shm = None  # persistent shared memory block
 
@@ -301,7 +331,8 @@ def generate_epoch(total_duration_seconds=300,
                    n_fft=DEFAULT_N_FFT,
                    hop_length=DEFAULT_HOP_LENGTH,
                    azi_bins=180,
-                   max_distance=3.0,
+                   room_size=[10.0, 10.0, 3.0],
+                   listener_pos=[5.0, 5.0, 1.5],
                    sigma=15.0,
                    sounds_dir=r"sounds\sounds",
                    num_workers=14,
@@ -321,10 +352,15 @@ def generate_epoch(total_duration_seconds=300,
 
 
 
+    # Calculate dynamic max distance from room boundaries (closest wall)
+    lx, ly, _ = listener_pos
+    rx, ry, _ = room_size
+    max_distance = min(lx, rx - lx, ly, ry - ly)
+
     # --- One-time initialization ---
     if not _initialized:
         preload_audio(sounds_dir, sr=sr)
-        precompute_hrir_grid(max_distance=max_distance)
+        precompute_hrir_grid(max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
 
         wav_files = _get_wav_paths(sounds_dir)
         _filtered_wav_files = [f for f in wav_files if f in _audio_cache]
@@ -334,9 +370,6 @@ def generate_epoch(total_duration_seconds=300,
         dummy_stft = librosa.stft(np.zeros(window_samples, dtype=np.float32),
                                   n_fft=n_fft, hop_length=hop_length)
         _cached_T = dummy_stft.shape[1]
-
-        # Start persistent process pool
-        _persistent_pool = ProcessPoolExecutor(max_workers=num_workers)
 
         _initialized = True
         print(f"Initialization complete: {len(_filtered_wav_files)} audio files, T={_cached_T}")
@@ -460,7 +493,7 @@ def generate_epoch(total_duration_seconds=300,
 
                 # Pack job (removed hrir_L/R from args, worker looks them up)
                 spat_jobs.append((i, dry_mono, start_azi, start_dist, end_azi, end_dist, max_distance,
-                                  start_sample, _shm.name, buf_shape, random.randint(0, 999999)))
+                                  room_size, listener_pos, start_sample, _shm.name, buf_shape, random.randint(0, 999999)))
                 
                 # Store event metadata
                 # For moving sounds, we need start/end azi to interpolate labels
@@ -675,7 +708,7 @@ if __name__ == "__main__":
     chunks, labels, meta = generate_epoch(
         total_duration_seconds=60,
         num_sounds=30,
-        update_interval_ms=3000,
+        update_interval_ms=2000,
     )
     print(f"Chunks: {chunks.shape}")
     print(f"Labels: {labels.shape}")
