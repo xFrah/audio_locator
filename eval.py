@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from main import SpatialAudioHeatmapLocator
 from convert_wav import NUM_SPATIAL_CHANNELS, NUM_GCC_CHANNELS
 from dataset import generate_epoch
-from train import LiveComparisonPlot
+from plot import LiveComparisonPlot
 
 
 def evaluate(model_path="resume.pt",
