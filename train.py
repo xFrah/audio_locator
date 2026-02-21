@@ -37,7 +37,7 @@ def bce_loss(pred_logits, target):
 
 def train(epochs=100,
           batch_size=24,
-          lr=1e-5,
+          lr=1e-6,
           azi_bins=180,
           epoch_duration_seconds=5000,
           device=None):
