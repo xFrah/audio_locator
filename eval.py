@@ -59,23 +59,16 @@ def evaluate(model_path="resume.pt",
         # Update via LiveComparisonPlot
         live_plot.update(gt, pred_logits, sample_md, f"Sample {sample_idx} ({i+1}/{len(chunks)})")
 
-    def on_key(event):
-        nonlocal idx
-        if event.key in ("right", " ", "n"):
-            idx += 1
-            show_sample(idx)
-        elif event.key in ("left", "p"):
-            idx = max(0, idx - 1)
-            show_sample(idx)
-        elif event.key in ("q", "escape"):
-            live_plot.stop()
-            plt.close(live_plot._fig)
-
-    live_plot._fig.canvas.mpl_connect("key_press_event", on_key)
-
-    show_sample(0)
-    print("\nControls: Right/Space = next, Left = prev, Q/Esc = quit")
-    plt.show(block=True)
+    print("\nCycling through samples every 2 seconds. Press Ctrl+C to stop.")
+    import time
+    try:
+        for i in range(len(chunks)):
+            show_sample(i)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("\nStopping evaluation...")
+    finally:
+        live_plot.stop()
 
 
 if __name__ == "__main__":
