@@ -13,7 +13,7 @@ from scipy.signal import fftconvolve
 from convert_wav import (
     DEFAULT_SAMPLE_RATE, DEFAULT_N_FFT, DEFAULT_HOP_LENGTH,
     DEFAULT_WINDOW_SIZE_SECONDS, DEFAULT_GCC_MAX_TAU,
-    DEFAULT_FREQ_BINS, NUM_FEATURE_CHANNELS, compute_spatial_features,
+    DEFAULT_FREQ_BINS, NUM_SPATIAL_CHANNELS, NUM_GCC_CHANNELS, compute_spatial_features,
 )
 
 # Initialize persistent pool globally using all available cores minus one
@@ -253,13 +253,13 @@ def _compute_spectrogram(args):
     ch1 = buffer[1, win_start:win_end].astype(np.float32)
     shm.close()
 
-    features = compute_spatial_features(
+    spatial_features, gcc_features = compute_spatial_features(
         ch0, ch1,
         sr=sr, n_fft=n_fft, hop_length=hop_length,
         n_gcc_bins=n_gcc_bins,
-    )  # (5, F_max, T)
+    )  # (4, F_max, T) and (1, n_gcc_bins, T)
 
-    return win_idx, features
+    return win_idx, spatial_features, gcc_features
 
 
 def _spatialize_sound(args):
@@ -369,7 +369,8 @@ def generate_epoch(total_duration_seconds=300,
     """Generate a fresh random dataset in memory using cached HRIRs and audio.
 
     Returns:
-        chunks: np.ndarray of shape (num_windows, NUM_FEATURE_CHANNELS, F_max, T)
+        chunks_spatial: np.ndarray of shape (num_windows, NUM_SPATIAL_CHANNELS, F_max, T)
+        chunks_gcc: np.ndarray of shape (num_windows, NUM_GCC_CHANNELS, n_gcc_bins, T)
         labels: np.ndarray of shape (num_windows, azi_bins)
         metadata_list: list of list of dicts (one list per window, containing metadata for active sounds)
     """
@@ -610,13 +611,15 @@ def generate_epoch(total_duration_seconds=300,
         win_end = win_start + window_samples
         spec_jobs.append((win_idx, win_start, win_end, _shm.name, buf_shape, sr, n_fft, hop_length, n_gcc_bins))
 
-    chunks = np.zeros((num_windows, NUM_FEATURE_CHANNELS, F_max, T), dtype=np.float32)
+    chunks_spatial = np.zeros((num_windows, NUM_SPATIAL_CHANNELS, F_max, T), dtype=np.float32)
+    chunks_gcc = np.zeros((num_windows, NUM_GCC_CHANNELS, n_gcc_bins, T), dtype=np.float32)
 
     results = tqdm(_persistent_pool.map(_compute_spectrogram, spec_jobs, chunksize=32),
                         total=num_windows, desc="Features", leave=False)
 
-    for win_idx, spec in results:
-        chunks[win_idx] = spec
+    for win_idx, spec, gcc in results:
+        chunks_spatial[win_idx] = spec
+        chunks_gcc[win_idx] = gcc
 
 
     # --- 3. Labels with intensity-scaled blobs ---
@@ -753,22 +756,24 @@ def generate_epoch(total_duration_seconds=300,
     # Filter out silent windows (where max label is 0)
     # We only want to train on windows that have at least one active sound
     has_active_sound = labels.max(axis=1) > 0
-    chunks = chunks[has_active_sound]
+    chunks_spatial = chunks_spatial[has_active_sound]
+    chunks_gcc = chunks_gcc[has_active_sound]
     labels = labels[has_active_sound]
     
     # Filter metadata list
     metadata_list = [m for i, m in enumerate(metadata_list) if has_active_sound[i]]
 
-    return chunks, labels, metadata_list
+    return chunks_spatial, chunks_gcc, labels, metadata_list
 
 
 # --- CLI: quick test ---
 if __name__ == "__main__":
-    chunks, labels, meta = generate_epoch(
+    chunks_spatial, chunks_gcc, labels, meta = generate_epoch(
         total_duration_seconds=60,
         num_sounds=30,
         update_interval_ms=2000,
     )
-    print(f"Chunks: {chunks.shape}")
+    print(f"Chunks Spatial: {chunks_spatial.shape}")
+    print(f"Chunks GCC: {chunks_gcc.shape}")
     print(f"Labels: {labels.shape}")
     print(f"Label range: [{labels.min():.4f}, {labels.max():.4f}]")

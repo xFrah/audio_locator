@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 
-from convert_wav import prepare_audio_input_librosa, NUM_FEATURE_CHANNELS
+from convert_wav import NUM_SPATIAL_CHANNELS, NUM_GCC_CHANNELS
 
 
 class AttentionPool(nn.Module):
@@ -96,12 +96,12 @@ class SEResNetBlock(nn.Module):
 
 
 class SpatialAudioHeatmapLocator(nn.Module):
-    def __init__(self, input_channels=NUM_FEATURE_CHANNELS, azi_bins=180):
+    def __init__(self, input_channels=NUM_SPATIAL_CHANNELS, gcc_channels=NUM_GCC_CHANNELS, azi_bins=180):
         super().__init__()
         self.azi_bins = azi_bins
 
-        # 1. ENCODER (ResNet + CoordConv + SE Blocks)
-        # Input: (B, 5, 1025, T)
+        # 1. ENCODER FOR SPATIAL FEATURES (ResNet + CoordConv + SE Blocks)
+        # Input: (B, 4, 1025, T)
         
         # Initial CoordConv preserves the critical frequency mappings immediately
         self.init_conv = nn.Sequential(
@@ -121,14 +121,27 @@ class SpatialAudioHeatmapLocator(nn.Module):
             SEResNetBlock(512, 1024, stride=(2, 1), kernel_size=(3, 3)),
             # 33 -> 17
             SEResNetBlock(1024, 1024, stride=(2, 1), kernel_size=(3, 3)),
-            # 17 -> 9
-            SEResNetBlock(1024, 1024, stride=(2, 1), kernel_size=(3, 3)),
-            # 9 -> 5
-            SEResNetBlock(1024, 1024, stride=(2, 1), kernel_size=(3, 3)),
+            # Stop downsampling freq here to preserve HRTF spectral cues (17 bins)
+            SEResNetBlock(1024, 1024, stride=(1, 1), kernel_size=(3, 3)),
         )
 
-        # Output shape is (B, 1024, 5, T) -> Flatten freq -> (B, 5120, T)
-        rnn_input_dim = 1024 * 5
+        # Dimension reduction to save parameters before RNN
+        self.spatial_proj = nn.Conv2d(1024, 256, kernel_size=1)
+        
+        # 1.5. ENCODER FOR GCC-PHAT FEATURES
+        # Input: (B, 1, 64, T)
+        self.gcc_conv = nn.Sequential(
+            nn.Conv2d(gcc_channels, 32, kernel_size=(3, 5), stride=(2, 1), padding=(1, 2)), # 64 -> 32
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            SEResNetBlock(32, 64, stride=(2, 1), kernel_size=(3, 3)),   # 32 -> 16
+            SEResNetBlock(64, 128, stride=(2, 1), kernel_size=(3, 3)),  # 16 -> 8
+            SEResNetBlock(128, 256, stride=(2, 1), kernel_size=(3, 3)), # 8 -> 4
+        )
+
+        # Output shapes: Spatial = (B, 256, 17, T) -> Flatten freq -> (B, 4352, T)
+        #                GCC = (B, 256, 4, T)     -> Flatten lag -> (B, 1024, T)
+        rnn_input_dim = (256 * 17) + (256 * 4) # 5376
 
         # 2. TEMPORAL: Bidirectional GRU
         self.rnn = nn.GRU(input_size=rnn_input_dim, hidden_size=1024,
@@ -146,15 +159,25 @@ class SpatialAudioHeatmapLocator(nn.Module):
             nn.Linear(1024, azi_bins)
         )
 
-    def forward(self, x):
-        # x: (B, C, F, T)
-        x = self.init_conv(x)            # (B, 64, 513, T)
-        x = self.encoder(x)              # (B, 1024, 5, T)
+    def forward(self, x_spatial, x_gcc):
+        # x_spatial: (B, 4, F, T)
+        # x_gcc: (B, 1, L, T)
         
-        # Merge Channel and Freq dimensions
-        B, C, F, T = x.shape
-        x = x.permute(0, 3, 1, 2)        # (B, T, C, F)
-        x = x.contiguous().view(B, T, C * F)  # (B, T, 10240)
+        # Spatial branch
+        s = self.init_conv(x_spatial)    # (B, 64, 513, T)
+        s = self.encoder(s)              # (B, 1024, 17, T)
+        s = self.spatial_proj(s)         # (B, 256, 17, T)
+        
+        B, C_s, F_s, T = s.shape
+        s = s.permute(0, 3, 1, 2).contiguous().view(B, T, C_s * F_s)  # (B, T, 4352)
+        
+        # GCC branch
+        g = self.gcc_conv(x_gcc)         # (B, 256, 4, T)
+        B, C_g, F_g, T = g.shape
+        g = g.permute(0, 3, 1, 2).contiguous().view(B, T, C_g * F_g)  # (B, T, 1024)
+        
+        # Concatenate features along feature dimension
+        x = torch.cat([s, g], dim=-1)    # (B, T, 5376)
         
         rnn_out, _ = self.rnn(x)         # (B, T, 2048)
 
@@ -184,17 +207,18 @@ def visualize_azimuth(logits_tensor, title="Azimuth Prediction"):
 # --- RUNTIME EXAMPLE ---
 
 if __name__ == "__main__":
-    model = SpatialAudioHeatmapLocator(input_channels=NUM_FEATURE_CHANNELS, azi_bins=180)
+    model = SpatialAudioHeatmapLocator(input_channels=NUM_SPATIAL_CHANNELS, gcc_channels=NUM_GCC_CHANNELS, azi_bins=180)
 
     # Use dummy input
-    # Input shape: (Batch, Channels, Freq, Time)
-    dummy_input = torch.randn(1, NUM_FEATURE_CHANNELS, 1025, 431) 
-    print(f"Dummy input shape: {dummy_input.shape}")
+    dummy_spatial = torch.randn(1, NUM_SPATIAL_CHANNELS, 1025, 431) 
+    dummy_gcc = torch.randn(1, NUM_GCC_CHANNELS, 64, 431) 
+    print(f"Dummy spatial shape: {dummy_spatial.shape}")
+    print(f"Dummy gcc shape: {dummy_gcc.shape}")
 
     print("Running forward pass...")
     model.eval()
     with torch.no_grad():
-        raw_output = model(dummy_input)  # Output shape: (1, 180)
+        raw_output = model(dummy_spatial, dummy_gcc)  # Output shape: (1, 180)
 
     print(f"Output shape: {raw_output.shape}")
     print("Visualizing raw (untrained) weights...")

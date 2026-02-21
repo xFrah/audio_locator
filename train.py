@@ -16,7 +16,7 @@ import random
 from tqdm import tqdm
 
 from main import SpatialAudioHeatmapLocator
-from convert_wav import NUM_FEATURE_CHANNELS
+from convert_wav import NUM_SPATIAL_CHANNELS, NUM_GCC_CHANNELS
 from dataset import generate_epoch
 
 
@@ -249,13 +249,17 @@ def train(epochs=100,
 
     # --- Model, optimizer ---
     model = SpatialAudioHeatmapLocator(
-        input_channels=NUM_FEATURE_CHANNELS, azi_bins=azi_bins
+        input_channels=NUM_SPATIAL_CHANNELS, gcc_channels=NUM_GCC_CHANNELS, azi_bins=azi_bins
     ).to(device)
 
     if os.path.exists("resume.pt"):
-        print("Found resume.pt, resuming training from these weights...")
-        state_dict = torch.load("resume.pt", map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
+        print("Found resume.pt, attempting to resume training from these weights...")
+        try:
+            state_dict = torch.load("resume.pt", map_location=device, weights_only=True)
+            model.load_state_dict(state_dict)
+            print("Successfully loaded resume.pt")
+        except RuntimeError as e:
+            print(f"Failed to load resume.pt due to architecture change. Starting fresh. Error snippet: {str(e)[:100]}...")
 
     # Use DataParallel if multiple GPUs are available
     if torch.cuda.device_count() > 1:
@@ -279,14 +283,16 @@ def train(epochs=100,
 
         # Generate this epoch's data
         tqdm.write(f"\nGenerating epoch {epoch+1} data ({epoch_duration_seconds}s, {num_sounds} sounds)…")
-        train_chunks, train_labels, train_metadata = generate_epoch(**gen_kwargs)
-        train_chunks = torch.from_numpy(train_chunks)
+        train_chunks_spatial, train_chunks_gcc, train_labels, train_metadata = generate_epoch(**gen_kwargs)
+        train_chunks_spatial = torch.from_numpy(train_chunks_spatial)
+        train_chunks_gcc = torch.from_numpy(train_chunks_gcc)
         train_labels = torch.from_numpy(train_labels)
-        tqdm.write(f"--- Epoch {epoch+1}: {len(train_chunks)} train samples ready")
+        tqdm.write(f"--- Epoch {epoch+1}: {len(train_chunks_spatial)} train samples ready")
 
         # Shuffle
-        perm = torch.randperm(len(train_chunks))
-        train_chunks = train_chunks[perm]
+        perm = torch.randperm(len(train_chunks_spatial))
+        train_chunks_spatial = train_chunks_spatial[perm]
+        train_chunks_gcc = train_chunks_gcc[perm]
         train_labels = train_labels[perm]
         train_metadata = [train_metadata[i] for i in perm.tolist()]
 
@@ -295,14 +301,15 @@ def train(epochs=100,
         train_loss = 0.0
         train_batches = 0
 
-        batch_bar = tqdm(range(0, len(train_chunks), batch_size),
+        batch_bar = tqdm(range(0, len(train_chunks_spatial), batch_size),
                          desc=f"Epoch {epoch+1} train", leave=False)
         for start in batch_bar:
-            end = min(start + batch_size, len(train_chunks))
-            x = train_chunks[start:end].to(device)
+            end = min(start + batch_size, len(train_chunks_spatial))
+            x_spatial = train_chunks_spatial[start:end].to(device)
+            x_gcc = train_chunks_gcc[start:end].to(device)
             y = train_labels[start:end].to(device)
 
-            pred = model(x)
+            pred = model(x_spatial, x_gcc)
             loss = bce_loss(pred, y)
 
             optimizer.zero_grad()
@@ -334,7 +341,8 @@ def train(epochs=100,
             tqdm.write(f"New best loss! Saved model to {save_path}")
 
         # --- Explicit Garbage Collection to prevent RAM spikes ---
-        del train_chunks
+        del train_chunks_spatial
+        del train_chunks_gcc
         del train_labels
         del train_metadata
         gc.collect()
