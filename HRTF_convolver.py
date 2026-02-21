@@ -278,30 +278,34 @@ def generate_moving_sound(dry_data, sr):
 
     from scipy.signal import fftconvolve, get_window
 
-    hop = L // 2
-    window = get_window("hann", L).astype(np.float32)
+    window_size = 512
+    hop = window_size // 2
+    window = get_window("hann", window_size).astype(np.float32)
 
-    for b_start in range(0, n_samples - L + 1, hop):
-        b_end = b_start + L
-        x_r = dry_data[b_start:b_end]
-        x_r_lp = dry_data_lp[b_start:b_end]
+    start_azi = random.uniform(0, 360)
+    curr_dist = random.uniform(DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
 
-        x_r = x_r * window
-        x_r_lp = x_r_lp * window
+    def get_pos(t_sec):
+        azi = (start_azi + t_sec * 30.0) % 360
+        dist = curr_dist + np.sin(2 * np.pi * t_sec / 5.0) * max(0.5, curr_dist * 0.5)
+        dist = np.clip(dist, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
+        return azi, dist
 
-        t_center = (b_start + hop) / sr  # Center of the windowed segment
+    for b_start in range(0, n_samples - window_size + 1, hop):
+        b_end = b_start + window_size
+        x_r = dry_data[b_start:b_end] * window
+        x_r_lp = dry_data_lp[b_start:b_end] * window
 
-        curr_azi = (start_azi + t_center * 30.0) % 360
-        curr_dist_osc = curr_dist + np.sin(2 * np.pi * t_center / 5.0) * max(0.5, curr_dist * 0.5)
-        curr_dist_osc = np.clip(curr_dist_osc, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
+        t_center = (b_start + hop) / sr
+        azi1, dist1 = get_pos(t_center)
 
-        h_l, h_r = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=_hrir_shm_meta, azimuth=curr_azi, distance=curr_dist_osc)
+        h_l_next, h_r_next = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=_hrir_shm_meta, azimuth=azi1, distance=dist1)
 
-        conv_L = fftconvolve(x_r, h_l, mode="full")
-        conv_R = fftconvolve(x_r, h_r, mode="full")
+        conv_L_cross = fftconvolve(x_r, h_l_next, mode="full")
+        conv_R_cross = fftconvolve(x_r, h_r_next, mode="full")
 
         # Align low frequencies to the peak of the direct path of the HRIR
-        peak_idx = np.argmax(np.abs(h_l))
+        peak_idx = np.argmax(np.abs(h_l_next))
         lp_start = b_start + peak_idx
 
         if lp_start < out_length:
@@ -309,13 +313,13 @@ def generate_moving_sound(dry_data, sr):
             spatial_L[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
             spatial_R[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
 
-        l_conv = len(conv_L)
+        l_conv = len(conv_L_cross)
         target_end = min(b_start + l_conv, out_length)
         write_len_hp = target_end - b_start
 
         if write_len_hp > 0:
-            spatial_L[b_start:target_end] += conv_L[:write_len_hp]
-            spatial_R[b_start:target_end] += conv_R[:write_len_hp]
+            spatial_L[b_start:target_end] += conv_L_cross[:write_len_hp]
+            spatial_R[b_start:target_end] += conv_R_cross[:write_len_hp]
 
     stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
     peak = np.max(np.abs(stereo_buffer))
