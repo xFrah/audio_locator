@@ -249,7 +249,7 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=No
     return hrir_L, hrir_R
 
 
-def generate_moving_sound(dry_data, sr):
+def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist):
     import random
     from convert_wav import DEFAULT_SAMPLE_RATE
 
@@ -269,9 +269,6 @@ def generate_moving_sound(dry_data, sr):
 
     print(f"Generating movement over {duration_sec:.2f} seconds using overlap-add...")
 
-    start_azi = random.uniform(0, 360)
-    curr_dist = random.uniform(DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
-
     cutoff_freq = 200.0
     dry_data_lp = butter_lp_filter(signal=dry_data, cutoff=cutoff_freq)
     dry_data = butter_hp_filter(signal=dry_data, cutoff=cutoff_freq)
@@ -282,12 +279,20 @@ def generate_moving_sound(dry_data, sr):
     hop = window_size // 2
     window = get_window("hann", window_size).astype(np.float32)
 
-    start_azi = random.uniform(0, 360)
-    curr_dist = random.uniform(DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
+    # Convert start/end to Cartesian
+    sa_rad = np.radians(start_azi)
+    ea_rad = np.radians(end_azi)
 
-    def get_pos(t_sec):
-        azi = (start_azi + t_sec * 30.0) % 360
-        dist = curr_dist + np.sin(2 * np.pi * t_sec / 5.0) * max(0.5, curr_dist * 0.5)
+    sx, sy = start_dist * np.sin(sa_rad), start_dist * np.cos(sa_rad)
+    ex, ey = end_dist * np.sin(ea_rad), end_dist * np.cos(ea_rad)
+
+    def get_pos(progress):
+        progress = np.clip(progress, 0.0, 1.0)
+        cur_x = sx + (ex - sx) * progress
+        cur_y = sy + (ey - sy) * progress
+
+        dist = np.sqrt(cur_x**2 + cur_y**2)
+        azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
         dist = np.clip(dist, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
         return azi, dist
 
@@ -296,8 +301,8 @@ def generate_moving_sound(dry_data, sr):
         x_r = dry_data[b_start:b_end] * window
         x_r_lp = dry_data_lp[b_start:b_end] * window
 
-        t_center = (b_start + hop) / sr
-        azi1, dist1 = get_pos(t_center)
+        progress = (b_start + hop) / n_samples
+        azi1, dist1 = get_pos(progress)
 
         h_l_next, h_r_next = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=_hrir_shm_meta, azimuth=azi1, distance=dist1)
 
@@ -345,7 +350,7 @@ if __name__ == "__main__":
         dry_data = load_and_resample(audio_path, target_sr=sr)
 
         load_hrir_cache()
-        stereo_buffer = generate_moving_sound(dry_data, sr)
+        stereo_buffer = generate_moving_sound(dry_data, sr, start_azi=0, start_dist=2.0, end_azi=270, end_dist=2.0)
 
         print(f"Writing to {output_path}...")
         sf.write(output_path, stereo_buffer.T, sr)
