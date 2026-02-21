@@ -39,14 +39,15 @@ def generate_moving_sound(duration_sec=40.0, output_path="moving_sound.wav", aud
     hrir_r = np.array(hrir_mat['hrir_r'])
 
     # Overlap-save algorithm parameters from HRTF_convolver.py
-    L = 2048 # Window size for the input chunk
+    L = 512 # Window size for the input chunk
     M = 200  # HRIR length
     N = int(2**np.ceil(np.log2(np.abs(L+M-1)))) # DFT size
     
     # Adjusted L so that N is a power of 2
     L = N - M + 1 
     
-    buffer_OLAP = np.zeros(M - 1)
+    buffer_OLAP_L = np.zeros(M - 1)
+    buffer_OLAP_R = np.zeros(M - 1)
     
     # We will accumulate output here. Since output is same length as input + reverb tail (which we can truncate)
     out_length = n_samples
@@ -59,14 +60,21 @@ def generate_moving_sound(duration_sec=40.0, output_path="moving_sound.wav", aud
     # Keep elevation near 0
     curr_el = 0.0 
     
+    # Filter the entire audio track offline to prevent zero-phase chunking edge artifacts
+    cutoff_freq = 200.0
+    dry_data_lp = HRTF_convolver.butter_lp_filter(signal=dry_data, cutoff=cutoff_freq)
+    dry_data = HRTF_convolver.butter_hp_filter(signal=dry_data, cutoff=cutoff_freq)
+    
     for b_start in range(0, n_samples, L):
         b_end = min(b_start + L, n_samples)
         x_r = dry_data[b_start:b_end]
+        x_r_lp = dry_data_lp[b_start:b_end]
         
         # If last block is shorter than L, pad it with zeros
         padded_chunk = False
         if len(x_r) < L:
             x_r = np.pad(x_r, (0, L - len(x_r)))
+            x_r_lp = np.pad(x_r_lp, (0, L - len(x_r_lp)))
             padded_chunk = True
             
         # Calculate current position
@@ -91,24 +99,30 @@ def generate_moving_sound(duration_sec=40.0, output_path="moving_sound.wav", aud
         h = np.hstack((h, np.zeros((2, N-(M-1)))))
         H = np.fft.fft(h, N)
         
-        # Overlap Save Algorithm
-        x_r_overlap = np.hstack((buffer_OLAP, x_r))
-        x_r_zeropad = np.hstack((x_r_overlap, np.zeros(N - len(x_r_overlap))))
+        # Overlap Save Algorithm on high frequencies
+        x_L_overlap = np.hstack((buffer_OLAP_L, x_r))
+        x_L_zeropad = np.hstack((x_L_overlap, np.zeros(N - len(x_L_overlap))))
+        
+        x_R_overlap = np.hstack((buffer_OLAP_R, x_r))
+        x_R_zeropad = np.hstack((x_R_overlap, np.zeros(N - len(x_R_overlap))))
         
         # Save overlap for next iteration
-        buffer_OLAP[:] = x_r_zeropad[N-(M-1):N]
+        buffer_OLAP_L[:] = x_L_zeropad[N-(M-1):N]
+        buffer_OLAP_R[:] = x_R_zeropad[N-(M-1):N]
         
-        # Crossover (low frequencies are non-directional)
-        x_r_zeropad_lp = HRTF_convolver.butter_lp_filter(signal=x_r_zeropad, cutoff=200, fs=sr)
-        x_r_zeropad_hp = HRTF_convolver.butter_hp_filter(signal=x_r_zeropad, cutoff=200, fs=sr)
+        # Convolution using high frequencies only
+        Xm_L = np.fft.fft(x_L_zeropad, N)
+        Xm_R = np.fft.fft(x_R_zeropad, N)
         
-        # Convolution
-        Xm = np.tile(np.fft.fft(x_r_zeropad_hp, N), (2, 1))
-        Ym = Xm * H
-        ym = np.real(np.fft.ifft(Ym))
+        Ym_L = Xm_L * H[0]
+        Ym_R = Xm_R * H[1]
         
-        l_out = ym[0, M-2:N] + x_r_zeropad_lp[M-2:N]
-        r_out = ym[1, M-2:N] + x_r_zeropad_lp[M-2:N]
+        ym_L = np.real(np.fft.ifft(Ym_L))
+        ym_R = np.real(np.fft.ifft(Ym_R))
+        
+        # Add back omnidirectional low frequencies (direct time-aligned addition)
+        l_out = ym_L[M-1:N+1] + x_r_lp # First M-1 samples are Aliased/Discarded
+        r_out = ym_R[M-1:N+1] + x_r_lp
         
         # Determine how much to write
         write_len = min(L, n_samples - b_start)

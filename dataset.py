@@ -117,22 +117,30 @@ def _spatialize_sound(args):
     # Check if stationary (or close enough)
     is_stationary = (abs(start_azi - end_azi) < 0.5) and (abs(start_dist - end_dist) < 0.1)
 
+    # Default crossover is 200 Hz
+    cutoff_freq = 200.0
+
     if is_stationary:
         # --- Fast Path: Static Convolution ---
+        ia_azi, ia_ele = HRTF_convolver.nav_to_interaural(start_azi, 0.0)
         hrir_L, hrir_R = HRTF_convolver.interp_hrir(
             triang=HRTF_convolver.TRI,
             points=HRTF_convolver.POINTS,
             T_inv=HRTF_convolver.T_INV,
             hrir_l=HRIR_L, hrir_r=HRIR_R,
-            azimuth=start_azi, elevation=0.0
+            azimuth=ia_azi, elevation=ia_ele
         )
-        spatial_L = fftconvolve(dry_mono, hrir_L, mode="full")
-        spatial_R = fftconvolve(dry_mono, hrir_R, mode="full")
+        # Filter out low frequencies so they are not spatialized
+        dry_mono_lp = HRTF_convolver.butter_lp_filter(signal=dry_mono, cutoff=cutoff_freq)
+        dry_mono_hp = HRTF_convolver.butter_hp_filter(signal=dry_mono, cutoff=cutoff_freq)
+
+        spatial_L = fftconvolve(dry_mono_hp, hrir_L, mode="full") + np.pad(dry_mono_lp, (0, len(hrir_L) - 1))
+        spatial_R = fftconvolve(dry_mono_hp, hrir_R, mode="full") + np.pad(dry_mono_lp, (0, len(hrir_R) - 1))
     
     else:
         # --- Dynamic Path: Overlap-Save Algorithm (Adapted from HRTF_convolver.py) ---
         # Parameters from HRTF_convolver.py
-        L_chunk = 2048 # Window size for input chunk
+        L_chunk = 512 # Window size for input chunk
         # HRIR length (fixed for CIPIC dataset to 200)
         M = 200
         N = int(2**np.ceil(np.log2(np.abs(L_chunk+M-1)))) # DFT size
@@ -146,14 +154,20 @@ def _spatialize_sound(args):
         out_length = n_samples
         spatial_L = np.zeros(out_length, dtype=np.float32)
         spatial_R = np.zeros(out_length, dtype=np.float32)
+        
+        # Filter the entire block offline to prevent zero-phase chunking edge artifacts
+        dry_mono_lp = HRTF_convolver.butter_lp_filter(signal=dry_mono, cutoff=cutoff_freq)
+        dry_mono_hp = HRTF_convolver.butter_hp_filter(signal=dry_mono, cutoff=cutoff_freq)
 
         for b_start in range(0, n_samples, L_chunk):
             b_end = min(b_start + L_chunk, n_samples)
-            x_r = dry_mono[b_start:b_end]
+            x_r = dry_mono_hp[b_start:b_end]
+            x_r_lp = dry_mono_lp[b_start:b_end]
             
             # If last block is shorter than L_chunk, pad it with zeros
             if len(x_r) < L_chunk:
                 x_r = np.pad(x_r, (0, L_chunk - len(x_r)))
+                x_r_lp = np.pad(x_r_lp, (0, L_chunk - len(x_r_lp)))
                 
             # Calculate current position at center of block
             t_center = (b_start + (b_start + L_chunk)) / 2 / n_samples
@@ -173,13 +187,16 @@ def _spatialize_sound(args):
             curr_dist = np.sqrt(cur_x**2 + cur_y**2)
             curr_azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
             
+            # Conver to interaural coordinates for CIPIC HRTF
+            ia_azi, ia_ele = HRTF_convolver.nav_to_interaural(curr_azi, 0.0)
+            
             # Lookup HRIR for this block
             h_L, h_R = HRTF_convolver.interp_hrir(
                 triang=HRTF_convolver.TRI,
                 points=HRTF_convolver.POINTS,
                 T_inv=HRTF_convolver.T_INV,
                 hrir_l=HRIR_L, hrir_r=HRIR_R,
-                azimuth=curr_azi, elevation=0.0
+                azimuth=ia_azi, elevation=ia_ele
             )
             
             # Compute DFT of impulse response
@@ -197,8 +214,8 @@ def _spatialize_sound(args):
             # Save overlap for next iteration
             buffer_OLAP_L[:] = x_L_zeropad[N-(M-1):N]
             buffer_OLAP_R[:] = x_R_zeropad[N-(M-1):N]
-            
-            # Convolution
+
+            # Convolution using only high pass filtered block
             Xm_L = np.fft.fft(x_L_zeropad, N)
             Xm_R = np.fft.fft(x_R_zeropad, N)
             
@@ -208,8 +225,9 @@ def _spatialize_sound(args):
             ym_L = np.real(np.fft.ifft(Ym_L))
             ym_R = np.real(np.fft.ifft(Ym_R))
             
-            l_out = ym_L[M-2:N] # First M-1 samples are Aliased/Discarded. Remaining are L samples.
-            r_out = ym_R[M-2:N]
+            # Add back in the low-pass audio (un-spatialized, equal on both channels)
+            l_out = ym_L[M-1:N+1] + x_r_lp # First M-1 samples are Aliased/Discarded
+            r_out = ym_R[M-1:N+1] + x_r_lp
             
             # Determine how much to write
             write_len = min(L_chunk, n_samples - b_start)

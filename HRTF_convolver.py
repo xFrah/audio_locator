@@ -297,6 +297,15 @@ def interp_hrir(triang, points, T_inv, hrir_l, hrir_r, azimuth, elevation):
 
     position = [azimuth, elevation]
     triangle = triang.find_simplex(position)
+    
+    if triangle == -1:
+        # Prevent hard crash/pop if point is outside the HRTF convex hull
+        dists = np.sum((points - position)**2, axis=1)
+        nearest = np.argmin(dists)
+        interp_hrir_l[:] = hrir_l[AZ[points[nearest][0]]][EL[points[nearest][1]]][:]
+        interp_hrir_r[:] = hrir_r[AZ[points[nearest][0]]][EL[points[nearest][1]]][:]
+        return interp_hrir_l, interp_hrir_r
+        
     vert = points[triang.simplices[triangle]]
 
     X = position - vert[2]
