@@ -18,6 +18,7 @@ from convert_wav import (
 
 # Initialize persistent pool globally using all available cores minus one
 _persistent_pool = ProcessPoolExecutor(max_workers=max(1, os.cpu_count() - 1))
+# _persistent_pool = ProcessPoolExecutor(max_workers=8)
 
 MAX_RMS_THRESHOLD = 0.15
 RMS_WINDOW_DURATION = 0.05  # 50ms for instantaneous intensity
@@ -359,8 +360,10 @@ def generate_epoch(total_duration_seconds=300,
                    azi_bins=180,
                    room_size=[10.0, 10.0, 3.0],
                    listener_pos=[5.0, 5.0, 1.5],
+                   sigma_deg=13.0,
                    sounds_dir=r"sounds\sounds",
-                   num_workers=14,
+                   # num_workers=14,
+                   num_workers=8,
                    moving_prob=0.5,       # Probability that a sound moves
                    max_velocity=90.0):    # Max velocity in degrees/second
     """Generate a fresh random dataset in memory using cached HRIRs and audio.
@@ -719,11 +722,19 @@ def generate_epoch(total_duration_seconds=300,
                     
                     azi_idx = round(current_azi / 360 * azi_bins) % azi_bins
                     
-                    # Accumulate (max pooling with 1s)
-                    half_w = width_bins // 2
-                    for offset in range(-half_w, width_bins - half_w):
-                        idx = (int(azi_idx) + offset) % azi_bins
-                        labels[win_idx, idx] = 1.0
+                    # Accumulate (flat top + gaussian tails)
+                    azi_idx_float = current_azi / 360 * azi_bins
+                    width_bins_half = width_deg / 360 * azi_bins / 2.0
+                    sigma_bins = max(0.1, sigma_deg / 360 * azi_bins)
+                    
+                    for idx in range(azi_bins):
+                        # Circular discrete distance
+                        dist = min(abs(idx - azi_idx_float), azi_bins - abs(idx - azi_idx_float))
+                        if dist <= width_bins_half:
+                            val = 1.0
+                        else:
+                            val = np.exp(-((dist - width_bins_half)**2) / (2 * sigma_bins**2))
+                        labels[win_idx, idx] = max(labels[win_idx, idx], val)
                     
                     # Store metadata for visualization
                     # We want to know: ID, Trajectory (Start->End), Current Pos, Timing, Radius, Width

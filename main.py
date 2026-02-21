@@ -22,61 +22,117 @@ class AttentionPool(nn.Module):
         return (weights * x).sum(dim=1)  # (B, D)
 
 
+class CoordConv2d(nn.Module):
+    """
+    Adds Y (frequency) coordinate channel to give absolute spatial awareness
+    before applying standard Conv2d.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        # +1 for the Y-coord channel (ignoring X-coord which is time and shifts)
+        self.conv = nn.Conv2d(in_channels + 1, out_channels, kernel_size, stride, padding)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        # Create a linear spread [-1, 1] across the H dimension (Freq)
+        y_coords = torch.linspace(-1, 1, h, device=x.device, dtype=x.dtype)
+        y_coords = y_coords.view(1, 1, h, 1).expand(b, 1, h, w)
+        x = torch.cat([x, y_coords], dim=1)
+        return self.conv(x)
+
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation block for dynamic channel weighting."""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        y = self.squeeze(x).view(b, c)
+        y = self.excitation(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class SEResNetBlock(nn.Module):
+    """Residual Block with Squeeze-and-Excitation and larger temporal stride/dilation support."""
+    def __init__(self, in_channels, out_channels, stride=(2, 1), kernel_size=(3, 3)):
+        super().__init__()
+        
+        # Temporal receptive field expansion via padding
+        padding = (kernel_size[0] // 2, kernel_size[1] // 2)
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=(3, 3), stride=1, padding=(1, 1), bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.se = SEBlock(out_channels)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or stride != (1, 1) or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        
+        out += identity
+        out = F.relu(out)
+        return out
+
+
 class SpatialAudioHeatmapLocator(nn.Module):
     def __init__(self, input_channels=NUM_FEATURE_CHANNELS, azi_bins=180):
         super().__init__()
         self.azi_bins = azi_bins
 
-        # 1. ENCODER
+        # 1. ENCODER (ResNet + CoordConv + SE Blocks)
         # Input: (B, 5, 1025, T)
-        self.encoder = nn.Sequential(
-            # 1025 -> 513
-            nn.Conv2d(input_channels, 64, kernel_size=3, stride=(2, 1), padding=1),
+        
+        # Initial CoordConv preserves the critical frequency mappings immediately
+        self.init_conv = nn.Sequential(
+            CoordConv2d(input_channels, 64, kernel_size=(5, 5), stride=(2, 1), padding=(2, 2)),
             nn.BatchNorm2d(64),
-            nn.ReLU(),
-
-            # 513 -> 257 
-            nn.Conv2d(64, 128, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-
-            # 257 -> 129
-            nn.Conv2d(128, 256, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-
-            # 129 -> 65
-            nn.Conv2d(256, 512, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            
-            # 65 -> 33
-            nn.Conv2d(512, 1024, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(1024),
-            nn.ReLU(),
-
-            # 33 -> 17
-            nn.Conv2d(1024, 1024, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(1024),
-            nn.ReLU(),
-
-            # 17 -> 9
-            nn.Conv2d(1024, 2048, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(2048),
-            nn.ReLU(),
-            
-            # 9 -> 5
-            nn.Conv2d(2048, 2048, kernel_size=3, stride=(2, 1), padding=1),
-            nn.BatchNorm2d(2048),
-            nn.ReLU(),
+            nn.ReLU(inplace=True)
         )
 
-        # Output shape is (B, 2048, 5, T) -> Flatten freq -> (B, 10240, T)
-        rnn_input_dim = 2048 * 5
+        self.encoder = nn.Sequential(
+            # 513 -> 257  (Using wider temporal kernel to catch ITDs/ILDs early across frames)
+            SEResNetBlock(64, 128, stride=(2, 1), kernel_size=(3, 5)),
+            # 257 -> 129
+            SEResNetBlock(128, 256, stride=(2, 1), kernel_size=(3, 5)),
+            # 129 -> 65
+            SEResNetBlock(256, 512, stride=(2, 1), kernel_size=(3, 3)),
+            # 65 -> 33
+            SEResNetBlock(512, 1024, stride=(2, 1), kernel_size=(3, 3)),
+            # 33 -> 17
+            SEResNetBlock(1024, 1024, stride=(2, 1), kernel_size=(3, 3)),
+            # 17 -> 9
+            SEResNetBlock(1024, 1024, stride=(2, 1), kernel_size=(3, 3)),
+            # 9 -> 5
+            SEResNetBlock(1024, 1024, stride=(2, 1), kernel_size=(3, 3)),
+        )
+
+        # Output shape is (B, 1024, 5, T) -> Flatten freq -> (B, 5120, T)
+        rnn_input_dim = 1024 * 5
 
         # 2. TEMPORAL: Bidirectional GRU
         self.rnn = nn.GRU(input_size=rnn_input_dim, hidden_size=1024,
-                          num_layers=3, batch_first=True,
+                          num_layers=2, batch_first=True,
                           bidirectional=True, dropout=0.1)
 
         # 3. ATTENTION POOLING
@@ -85,26 +141,28 @@ class SpatialAudioHeatmapLocator(nn.Module):
         # 4. AZIMUTH HEAD
         self.head = nn.Sequential(
             nn.Linear(1024 * 2, 1024),
+            nn.Dropout(0.3),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(1024, azi_bins),
+            nn.Linear(1024, azi_bins)
         )
 
     def forward(self, x):
         # x: (B, C, F, T)
-        x = self.encoder(x)              # (B, 512, 5, T)
+        x = self.init_conv(x)            # (B, 64, 513, T)
+        x = self.encoder(x)              # (B, 1024, 5, T)
         
         # Merge Channel and Freq dimensions
         B, C, F, T = x.shape
         x = x.permute(0, 3, 1, 2)        # (B, T, C, F)
-        x = x.reshape(B, T, C * F)       # (B, T, 2560)
+        x = x.contiguous().view(B, T, C * F)  # (B, T, 10240)
         
-        rnn_out, _ = self.rnn(x)         # (B, T, 512)
+        rnn_out, _ = self.rnn(x)         # (B, T, 2048)
 
-        pooled = self.attn_pool(rnn_out)  # (B, 512)
+        pooled = self.attn_pool(rnn_out)  # (B, 2048)
 
-        logits = self.head(pooled)
-        return logits  # (B, azi_bins)
+        logits = self.head(pooled)       # (B, azi_bins)
+        return logits
+
 
 def visualize_azimuth(logits_tensor, title="Azimuth Prediction"):
     """
@@ -128,7 +186,7 @@ def visualize_azimuth(logits_tensor, title="Azimuth Prediction"):
 if __name__ == "__main__":
     model = SpatialAudioHeatmapLocator(input_channels=NUM_FEATURE_CHANNELS, azi_bins=180)
 
-    # Use dummy input instead of loading missing file
+    # Use dummy input
     # Input shape: (Batch, Channels, Freq, Time)
     dummy_input = torch.randn(1, NUM_FEATURE_CHANNELS, 1025, 431) 
     print(f"Dummy input shape: {dummy_input.shape}")
@@ -136,7 +194,7 @@ if __name__ == "__main__":
     print("Running forward pass...")
     model.eval()
     with torch.no_grad():
-        raw_output = model(dummy_input)  # Output shape: (1, 36)
+        raw_output = model(dummy_input)  # Output shape: (1, 180)
 
     print(f"Output shape: {raw_output.shape}")
     print("Visualizing raw (untrained) weights...")

@@ -237,14 +237,15 @@ class LiveComparisonPlot:
 
 
 def train(epochs=100,
-          batch_size=32,
-          lr=2e-4,
+          batch_size=12,
+          lr=1e-5,
           azi_bins=180,
           epoch_duration_seconds=5000,
           device=None):
 
     if device is None:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        # device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        device = "cuda:1" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
     # --- Model, optimizer ---
@@ -258,9 +259,9 @@ def train(epochs=100,
         model.load_state_dict(state_dict)
 
     # Use DataParallel if multiple GPUs are available
-    if torch.cuda.device_count() > 1:
-        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
-        model = torch.nn.DataParallel(model)
+    # if torch.cuda.device_count() > 1:
+    #     print(f"Using DataParallel on {torch.cuda.device_count()} GPUs")
+    #     model = torch.nn.DataParallel(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
