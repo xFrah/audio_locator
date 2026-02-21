@@ -1,20 +1,4 @@
-"""Implementation of a 3D Audio Panner using the CIPIC HRTF Database.
-
-Usage:
-
-Select a subject from the CIPIC database. You should select a subject
-with similar anthropometric measurements as yourself for the best
-experience.
-
-    - Note: Due to storage limitations, the repository has only 4
-            subjects of the database to choose from. The full database
-            is ~170MB and has 45 subjects. It can be downloaded for free
-            at:
-
-            https://www.ece.ucdavis.edu/cipic/spatial-sound/hrtf-data/
-
-            In order to make it work, you should simply replace the
-            folder ´CIPIC_hrtf_database´ with the one you downloaded.
+"""Implementation of a 3D Audio Panner using Cached HRIRs.
 
 Press 'Play' to start playing the default sound file. Move the Azimuth
 and Elevation sliders to position the sound in the 3D space.
@@ -24,25 +8,12 @@ are other sound samples in the folder resources/sound.
 
 *IMPORTANT:* For now, the only working format is a mono WAV file at
 44100 Hz sample rate and 16 bit depth.
-
-You can save the file at the specified pair of Azimuth/Elevation in
-File/Save audio file.
-
-Lastly, you can choose to use a crossover in order not to spatialize low
-frequencies, since low frequencies are non-directional in nature. Go to
-Settings/Change cutoff frequency to set the desired frequency. By
-default, crossover is set at 200 Hz.
-
-Author:         Francisco Rotea
-                (Buenos Aires, Argentina)
-Repository:     https://github.com/franciscorotea
-Email:          francisco.rotea@gmail.com
-
 """
 
 import os
 import wave
 import itertools
+import pickle
 
 import scipy.io
 from scipy.io import wavfile
@@ -50,132 +21,35 @@ import scipy.spatial
 import pyaudio
 import scipy.signal
 import librosa
-import pickle
-import slab
 from tqdm import tqdm
 
 import numpy as np
 import numpy.linalg
 
-# Values of azimuth and elevation angles measured in the CIPIC database.
-# See ´CIPIC_hrtf_database/doc/hrir_data_documentation.pdf´ for
-# information about the coordinate system and measurement procedure.
+# Values of azimuth and distance used for HRIR interpolation.
+AZIMUTH_ANGLES = np.arange(0, 360.5, 0.5)
+DISTANCE_STEPS = np.round(np.linspace(0.3, 5.0, 40), 2)
 
-AZIMUTH_ANGLES = [
-    -80,
-    -65,
-    -55,
-    -45,
-    -40,
-    -35,
-    -30,
-    -25,
-    -20,
-    -15,
-    -10,
-    -5,
-    0,
-    5,
-    10,
-    15,
-    20,
-    25,
-    30,
-    35,
-    40,
-    45,
-    55,
-    65,
-    80,
-]
 
-ELEVATION_ANGLES = -45 + 5.625 * np.arange(0, 50)
+# Convert polar to Cartesian for Delaunay triangulation
+# Conventions: x = d * sin(azi_rad), y = d * cos(azi_rad) (Clockwise from North)
+def polar_to_cartesian(azi, dist):
+    rad = np.radians(azi)
+    return dist * np.sin(rad), dist * np.cos(rad)
 
-POINTS = np.array(list(itertools.product(AZIMUTH_ANGLES, ELEVATION_ANGLES)))
 
-# Get indexes from angles.
+def cartesian_to_polar(x, y):
+    dist = np.sqrt(x**2 + y**2)
+    azi = np.degrees(np.arctan2(x, y)) % 360
+    return azi, dist
 
-AZ = dict(zip(AZIMUTH_ANGLES, np.arange(len(AZIMUTH_ANGLES))))
-EL = dict(zip(ELEVATION_ANGLES, np.arange(len(ELEVATION_ANGLES))))
 
-# Load anthropometric measurements data from the CIPIC database.
-
-# See ´CIPIC_hrtf_database/doc/anthropometry.pdf´ for information about
-# the parameters definition.
-
-anthro_data = scipy.io.loadmat("CIPIC_hrtf_database/anthropometry/anthro.mat")
-
-PARAMETERS = {
-    "info": ["Age:", "Sex:", "Weight:"],
-    "X": [
-        "Head width:",
-        "Head height:",
-        "Head depth:",
-        "Pinna offset down:",
-        "Pinna offset back:",
-        "Neck width:",
-        "Neck height:",
-        "Neck depth:",
-        "Torso top width:",
-        "Torso top height:",
-        "Torso top depth:",
-        "Shoulder width:",
-        "Head offset forward:",
-        "Height:",
-        "Seated height:",
-        "Head circumference:",
-        "Shoulder circumference:",
-    ],
-    "D": ["Cavum concha height", "Cymba concha height", "Cavum concha width", "Fossa height", "Pinna height", "Pinna width", "Intertragal incisure width", "Cavum concha depth"],
-    "theta": ["Pinna rotation angle:", "Pinna flare angle:"],
-}
-
-L_R = [" (left):", " (right):"]  # To use with 'D' and 'theta' parameters.
-
-# Clean anthropometric data for display.
-
-for key, value in anthro_data.items():
-    if key not in ["__header__", "__version__", "__globals__", "id", "sex"]:
-        if key == "age":
-            anthro_data[key][np.isnan(anthro_data[key])] = 0
-            anthro_data[key] = np.squeeze(value.astype("int")).astype("str")
-            anthro_data[key][anthro_data[key] == "0"] = "-"
-        else:
-            anthro_data[key] = np.around(np.squeeze(value), 1).astype("str")
-            anthro_data[key][anthro_data[key] == "nan"] = "-"
-
-# Get indexes from ID's.
-
-ANTHRO_ID = anthro_data["id"].flatten().tolist()
-ID_TO_IDX = dict(zip(ANTHRO_ID, range(len(ANTHRO_ID))))
-
-# Generate a list with all subject's ID present in the database.
-
-FOLDERS = os.listdir("CIPIC_hrtf_database/standard_hrir_database")
-SUBJECT_ID = [id_.strip("subject_") for id_ in FOLDERS if id_ != "show_data"]
+_polar_points = list(itertools.product(AZIMUTH_ANGLES, DISTANCE_STEPS))
+POINTS = np.array([polar_to_cartesian(a, d) for a, d in _polar_points])
+_POINTS_POLAR = np.array(_polar_points)  # Store to lookup dict quickly
 
 # Initialization variables for audio stream.
-
 SAMPLE_RATE = 44100
-
-# Initialization variables for overlap-save algorithm.
-
-# L = Window size.
-# M = Length of impulse response.
-# N = Size of the DFT. Since the length of the convolved signal will be
-#     L+M-1, it is rounded to the nearest power of 2 for efficient fft
-#     calculation.
-
-L = 2048
-M = 200
-N = int(2 ** np.ceil(np.log2(np.abs(L + M - 1))))
-
-L = N - M + 1
-
-# Preallocate interpolated impulse responses.
-
-interp_hrir_l = np.zeros(M)
-interp_hrir_r = np.zeros(M)
 
 
 def load_and_resample(file_path, target_sr=SAMPLE_RATE):
@@ -200,38 +74,22 @@ def load_and_resample(file_path, target_sr=SAMPLE_RATE):
 
 
 def butter_lp(cutoff, fs, order):
-    """Design of a digital Butterworth low pass filter with a
-    second-order section format for numerical stability."""
-
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
-
     sos = scipy.signal.butter(N=order, Wn=normal_cutoff, btype="lowpass", output="sos")
-
     return sos
 
 
 def butter_lp_filter(signal, cutoff, fs=SAMPLE_RATE, order=1):
-    """Filter a signal with the filter designed in ´butter_lp´.
-
-    Filfilt applies the linear filter twice, once forward and once
-    backwards, so that he combined filter has zero phase delay."""
-
     sos = butter_lp(cutoff=cutoff, fs=fs, order=order)
     out = scipy.signal.sosfiltfilt(sos, signal)
-
     return out
 
 
 def butter_hp(cutoff, fs, order):
-    """Design of a digital Butterworth high pass filter with a
-    second-order section format for numerical stability."""
-
     nyq = 0.5 * fs
     normal_cutoff = cutoff / nyq
-
     sos = scipy.signal.butter(N=order, Wn=normal_cutoff, btype="highpass", output="sos")
-
     return sos
 
 
@@ -243,16 +101,11 @@ def butter_hp_filter(signal, cutoff, fs=SAMPLE_RATE, order=1):
 
     sos = butter_hp(cutoff=cutoff, fs=fs, order=order)
     out = scipy.signal.sosfiltfilt(sos, signal)
-
     return out
 
 
 def create_triangulation(points):
-    """Generate a triangular mesh from HRTF measurement points (azimuth,
-    elevation) using the Delaunay triangulation algorithm."""
-
     triangulation = scipy.spatial.Delaunay(points)
-
     return triangulation
 
 
@@ -283,78 +136,74 @@ def calculate_T_inv(triang, points):
     C = points[triang.simplices][:, 2, :]
 
     T = np.empty((2 * A.shape[0], A.shape[1]))
-
     T[::2, :] = A - C
     T[1::2, :] = B - C
 
     T = T.reshape(-1, 2, 2)
-
     T_inv = np.linalg.inv(T)
-
     return T_inv
 
 
-def interp_hrir(triang, points, T_inv, hrir_l, hrir_r, azimuth, elevation):
-    """Estimate a HRTF for any point X lying inside the triangular mesh
-    calculated.
+def interp_hrir(triang, points, T_inv, hrir_dict, azimuth, distance):
+    azimuth = float(azimuth) % 360.0
+    distance = np.clip(float(distance), DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
 
-    This is done by interpolating the vertices of the triangle enclosing
-    X. Given a triangle with vertices A, B and C, any point X inside the
-    triangle can be represented as a linear combination of the vertices:
-
-    X = g_1 * A + g_2 * B + g_3 * C
-
-    where g_i are scalar weights. If the sum of the weights is equal to
-    1, these are barycentric coordinates of point X. Given a desired
-    source position X, barycentric interpolation weights are calculated
-    as:
-
-    [g_1, g_2] = (X - C) * T_inv
-    g_ 3 = 1 - g_1 - g_2
-
-    Barycentric coordinates are used as interpolation weights for
-    estimating the HRTF at point X as the weighted sum of the HRTFs
-    measured at A, B and C, respectively.
-
-    One of the main advantages of this interpolation approach is that
-    it does not cause discontinuities in the interpolated HRTFs: for a
-    source moving smoothly from one triangle to another, the HRTF
-    estimate changes smoothly, even at the crossing point.
-
-    For a more comprehensive explanation of the interpolation algorithm,
-    please refer to:
-
-    Gamper, H., Head-related transfer function interpolation in azimuth,
-    elevation, and distance, J. Acoust. Soc. Am. 134 (6), December 2013.
-
-    """
-
-    position = [azimuth, elevation]
+    x, y = polar_to_cartesian(azimuth, distance)
+    position = [x, y]
     triangle = triang.find_simplex(position)
 
     if triangle == -1:
-        # Prevent hard crash/pop if point is outside the HRTF convex hull
         dists = np.sum((points - position) ** 2, axis=1)
         nearest = np.argmin(dists)
-        interp_hrir_l[:] = hrir_l[AZ[points[nearest][0]]][EL[points[nearest][1]]][:]
-        interp_hrir_r[:] = hrir_r[AZ[points[nearest][0]]][EL[points[nearest][1]]][:]
-        return interp_hrir_l, interp_hrir_r
+        n_azi, n_dist = _POINTS_POLAR[nearest]
+        azi_key = float(n_azi) if n_azi < 360.0 else 0.0
+        dist_key = round(float(n_dist), 2)
+        h_l, h_r = hrir_dict[(azi_key, dist_key)]
+        return h_l.copy(), h_r.copy()
 
     vert = points[triang.simplices[triangle]]
+    vert_polar = _POINTS_POLAR[triang.simplices[triangle]]
 
     X = position - vert[2]
     g = np.dot(X, T_inv[triangle])
 
-    g_1 = g[0]
-    g_2 = g[1]
+    g_1, g_2 = g[0], g[1]
     g_3 = 1 - g_1 - g_2
 
     if g_1 >= 0 and g_2 >= 0 and g_3 >= 0:
-        interp_hrir_l[:] = g_1 * hrir_l[AZ[vert[0][0]]][EL[vert[0][1]]][:] + g_2 * hrir_l[AZ[vert[1][0]]][EL[vert[1][1]]][:] + g_3 * hrir_l[AZ[vert[2][0]]][EL[vert[2][1]]][:]
+        azi0 = float(vert_polar[0][0]) if vert_polar[0][0] < 360.0 else 0.0
+        h0_l, h0_r = hrir_dict[(azi0, round(float(vert_polar[0][1]), 2))]
 
-        interp_hrir_r[:] = g_1 * hrir_r[AZ[vert[0][0]]][EL[vert[0][1]]][:] + g_2 * hrir_r[AZ[vert[1][0]]][EL[vert[1][1]]][:] + g_3 * hrir_r[AZ[vert[2][0]]][EL[vert[2][1]]][:]
+        azi1 = float(vert_polar[1][0]) if vert_polar[1][0] < 360.0 else 0.0
+        h1_l, h1_r = hrir_dict[(azi1, round(float(vert_polar[1][1]), 2))]
 
-    return interp_hrir_l, interp_hrir_r
+        azi2 = float(vert_polar[2][0]) if vert_polar[2][0] < 360.0 else 0.0
+        h2_l, h2_r = hrir_dict[(azi2, round(float(vert_polar[2][1]), 2))]
+
+        max_len = max(len(h0_l), len(h1_l), len(h2_l))
+
+        def pad(h, ml):
+            if len(h) < ml:
+                return np.pad(h, (0, ml - len(h)))
+            return h
+
+        h0_l = pad(h0_l, max_len)
+        h0_r = pad(h0_r, max_len)
+        h1_l = pad(h1_l, max_len)
+        h1_r = pad(h1_r, max_len)
+        h2_l = pad(h2_l, max_len)
+        h2_r = pad(h2_r, max_len)
+
+        return (g_1 * h0_l + g_2 * h1_l + g_3 * h2_l), (g_1 * h0_r + g_2 * h1_r + g_3 * h2_r)
+
+    # Fallback to nearest
+    dists = np.sum((vert - position) ** 2, axis=1)
+    nearest = np.argmin(dists)
+    n_azi, n_dist = vert_polar[nearest]
+    azi_key = float(n_azi) if n_azi < 360.0 else 0.0
+    dist_key = round(float(n_dist), 2)
+    h_l, h_r = hrir_dict[(azi_key, dist_key)]
+    return h_l.copy(), h_r.copy()
 
 
 TRI = create_triangulation(points=POINTS)
@@ -362,17 +211,14 @@ T_INV = calculate_T_inv(triang=TRI, points=POINTS)
 
 # Shared Memory for HRIRs
 HRIR_CACHE_PATH = "hrir_cache.pkl"
-_hrir_shm_meta = None  # dict: (azi, dist) -> (offset_L, offset_R, length)
+_hrir_shm_meta = None  # dict: (azi, dist) -> (offset_L, offset_R, length) or directly (h_L, h_R) if from disk
 _hrir_shm_array = None  # ndarray mapped to shared memory
 
 
 def load_hrir_cache():
     """Load precomputed HRIRs from grid cache (disk only)."""
     global _hrir_shm_meta, _hrir_shm_array
-
     local_cache = {}
-
-    # Try loading from disk first
     if os.path.exists(HRIR_CACHE_PATH):
         print(f"Loading HRIR cache from {HRIR_CACHE_PATH}...")
         with open(HRIR_CACHE_PATH, "rb") as f:
@@ -380,38 +226,27 @@ def load_hrir_cache():
         print(f"Loaded {len(local_cache)} cached HRIRs")
     else:
         print(f"WARNING: {HRIR_CACHE_PATH} not found. Run dataset generation first to create it.")
-
     _hrir_shm_meta = local_cache
     _hrir_shm_array = None
 
 
 def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=None, room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
     global _hrir_shm_meta
-
     if _hrir_shm_meta is None:
-        raise RuntimeError("HRIR cache not initialized. Run precompute_hrir_grid() first.")
-
+        raise RuntimeError("HRIR cache not initialized.")
     if max_distance is None:
         lx, ly, _ = listener_pos
         rx, ry, _ = room_size
         max_distance = min(lx, rx - lx, ly, ry - ly)
-
     if dist_steps is None:
         dist_steps = np.linspace(0.3, max_distance, 40)
-
     azi_snapped = float(round(azi_deg / azi_step) * azi_step % 360)
     dist_snapped = round(float(dist_steps[np.argmin(np.abs(dist_steps - dist_m))]), 2)
-
     try:
         hrir_L, hrir_R = _hrir_shm_meta[(azi_snapped, dist_snapped)]
     except KeyError:
         return None, None
-
     return hrir_L, hrir_R
-
-
-def _get_interpolated_hrir(azi_deg, dist_m, max_distance=None, room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
-    return _lookup_hrir(azi_deg, dist_m, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos)
 
 
 def generate_moving_sound(dry_data, sr):
@@ -421,101 +256,68 @@ def generate_moving_sound(dry_data, sr):
     n_samples = len(dry_data)
     duration_sec = n_samples / sr
 
-    print("Loading HRIR data from CIPIC subject 003...")
-    subject = "003"
-    hrir_mat = scipy.io.loadmat("CIPIC_hrtf_database/standard_hrir_database/subject_" + subject + "/hrir_final.mat")
-    hrir_l = np.array(hrir_mat["hrir_l"])
-    hrir_r = np.array(hrir_mat["hrir_r"])
+    global _hrir_shm_meta
+    if _hrir_shm_meta is None:
+        raise RuntimeError("HRIR cache not initialized. Call load_hrir_cache() first.")
 
-    # Overlap-save algorithm parameters from HRTF_convolver.py
+    M = max(len(h_L) for h_L, h_R in _hrir_shm_meta.values())
     L = 512  # Window size for the input chunk
-    M = 200  # HRIR length
-    N = int(2 ** np.ceil(np.log2(np.abs(L + M - 1))))  # DFT size
 
-    # Adjusted L so that N is a power of 2
-    L = N - M + 1
-
-    buffer_OLAP_L = np.zeros(M - 1)
-    buffer_OLAP_R = np.zeros(M - 1)
-
-    # We will accumulate output here. Since output is same length as input + reverb tail (which we can truncate)
-    out_length = n_samples
+    out_length = n_samples + M - 1
     spatial_L = np.zeros(out_length, dtype=np.float32)
     spatial_R = np.zeros(out_length, dtype=np.float32)
 
-    print(f"Generating movement over {duration_sec} seconds using overlap-save...")
+    print(f"Generating movement over {duration_sec:.2f} seconds using overlap-add...")
 
-    start_azi = random.uniform(min(AZIMUTH_ANGLES), max(AZIMUTH_ANGLES))
-    # Keep elevation near 0
-    curr_el = 0.0
+    start_azi = random.uniform(0, 360)
+    curr_dist = random.uniform(DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
 
-    # Filter the entire audio track offline to prevent zero-phase chunking edge artifacts
     cutoff_freq = 200.0
     dry_data_lp = butter_lp_filter(signal=dry_data, cutoff=cutoff_freq)
     dry_data = butter_hp_filter(signal=dry_data, cutoff=cutoff_freq)
 
-    for b_start in range(0, n_samples, L):
-        b_end = min(b_start + L, n_samples)
+    from scipy.signal import fftconvolve, get_window
+
+    hop = L // 2
+    window = get_window("hann", L).astype(np.float32)
+
+    for b_start in range(0, n_samples - L + 1, hop):
+        b_end = b_start + L
         x_r = dry_data[b_start:b_end]
         x_r_lp = dry_data_lp[b_start:b_end]
 
-        # If last block is shorter than L, pad it with zeros
-        padded_chunk = False
-        if len(x_r) < L:
-            x_r = np.pad(x_r, (0, L - len(x_r)))
-            x_r_lp = np.pad(x_r_lp, (0, L - len(x_r_lp)))
-            padded_chunk = True
+        x_r = x_r * window
+        x_r_lp = x_r_lp * window
 
-        # Calculate current position
-        t_center = (b_start + (b_start + L)) / 2 / sr
+        t_center = (b_start + hop) / sr  # Center of the windowed segment
 
-        # Move back and forth in azimuth (-80 to 80)
-        # Period of 12 seconds
-        # Sine wave mapping to azimuth
-        curr_azi = np.sin(2 * np.pi * t_center / 12.0) * max(AZIMUTH_ANGLES)
+        curr_azi = (start_azi + t_center * 30.0) % 360
+        curr_dist_osc = curr_dist + np.sin(2 * np.pi * t_center / 5.0) * max(0.5, curr_dist * 0.5)
+        curr_dist_osc = np.clip(curr_dist_osc, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
 
-        # Interpolate to get the HRIR at the position selected
-        h_l, h_r = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_l=hrir_l, hrir_r=hrir_r, azimuth=curr_azi, elevation=curr_el)
+        h_l, h_r = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=_hrir_shm_meta, azimuth=curr_azi, distance=curr_dist_osc)
 
-        # Compute DFT of impulse response
-        h = np.vstack(([h_l, h_r]))
-        h = np.hstack((h, np.zeros((2, N - (M - 1)))))
-        H = np.fft.fft(h, N)
+        conv_L = fftconvolve(x_r, h_l, mode="full")
+        conv_R = fftconvolve(x_r, h_r, mode="full")
 
-        # Overlap Save Algorithm on high frequencies
-        x_L_overlap = np.hstack((buffer_OLAP_L, x_r))
-        x_L_zeropad = np.hstack((x_L_overlap, np.zeros(N - len(x_L_overlap))))
+        # Align low frequencies to the peak of the direct path of the HRIR
+        peak_idx = np.argmax(np.abs(h_l))
+        lp_start = b_start + peak_idx
 
-        x_R_overlap = np.hstack((buffer_OLAP_R, x_r))
-        x_R_zeropad = np.hstack((x_R_overlap, np.zeros(N - len(x_R_overlap))))
+        if lp_start < out_length:
+            write_len_lp = min(len(x_r_lp), out_length - lp_start)
+            spatial_L[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
+            spatial_R[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
 
-        # Save overlap for next iteration
-        buffer_OLAP_L[:] = x_L_zeropad[N - (M - 1) : N]
-        buffer_OLAP_R[:] = x_R_zeropad[N - (M - 1) : N]
+        l_conv = len(conv_L)
+        target_end = min(b_start + l_conv, out_length)
+        write_len_hp = target_end - b_start
 
-        # Convolution using high frequencies only
-        Xm_L = np.fft.fft(x_L_zeropad, N)
-        Xm_R = np.fft.fft(x_R_zeropad, N)
+        if write_len_hp > 0:
+            spatial_L[b_start:target_end] += conv_L[:write_len_hp]
+            spatial_R[b_start:target_end] += conv_R[:write_len_hp]
 
-        Ym_L = Xm_L * H[0]
-        Ym_R = Xm_R * H[1]
-
-        ym_L = np.real(np.fft.ifft(Ym_L))
-        ym_R = np.real(np.fft.ifft(Ym_R))
-
-        # Add back omnidirectional low frequencies (direct time-aligned addition)
-        l_out = ym_L[M - 1 : N + 1] + x_r_lp  # First M-1 samples are Aliased/Discarded
-        r_out = ym_R[M - 1 : N + 1] + x_r_lp
-
-        # Determine how much to write
-        write_len = min(L, n_samples - b_start)
-
-        if write_len > 0:
-            spatial_L[b_start : b_start + write_len] = l_out[:write_len]
-            spatial_R[b_start : b_start + write_len] = r_out[:write_len]
-
-    # Normalize
-    stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)  # (2, len)
+    stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
     peak = np.max(np.abs(stereo_buffer))
     if peak > 0:
         stereo_buffer = stereo_buffer / peak * 0.9

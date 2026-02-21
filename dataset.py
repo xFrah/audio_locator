@@ -229,15 +229,6 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=No
     return hrir_L, hrir_R
 
 
-def _get_interpolated_hrir(azi_deg, dist_m, max_distance=None,
-                           room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5], shm_meta=None):
-    """Get HRIR, supporting float queries by snapping (nearest neighbor for now)."""
-    # In the future, we could bilinearly interpolate between grid points.
-    # For now, nearest neighbor is sufficient if the grid is fine enough (1 deg).
-    return _lookup_hrir(azi_deg, dist_m, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos, shm_meta=shm_meta)
-
-
-
 # ============================================================
 # Worker for feature computation (multiprocessing)
 # ============================================================
