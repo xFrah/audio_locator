@@ -196,6 +196,7 @@ def interp_hrir(triang, points, T_inv, hrir_dict, azimuth, distance):
 
         return (g_1 * h0_l + g_2 * h1_l + g_3 * h2_l), (g_1 * h0_r + g_2 * h1_r + g_3 * h2_r)
 
+    raise ValueError("Could not find a valid triangle for the given position.")
     # Fallback to nearest
     dists = np.sum((vert - position) ** 2, axis=1)
     nearest = np.argmin(dists)
@@ -249,7 +250,7 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=No
     return hrir_L, hrir_R
 
 
-def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist, hrir_cache=None, normalize=True):
+def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist, hrir_cache=None, normalize=True, is_circular=False):
     import random
     from convert_wav import DEFAULT_SAMPLE_RATE
 
@@ -307,11 +308,18 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
 
     def get_pos(progress):
         progress = np.clip(progress, 0.0, 1.0)
-        cur_x = sx + (ex - sx) * progress
-        cur_y = sy + (ey - sy) * progress
+        if not is_circular:
+            cur_x = sx + (ex - sx) * progress
+            cur_y = sy + (ey - sy) * progress
 
-        dist = np.sqrt(cur_x**2 + cur_y**2)
-        azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
+            dist = np.sqrt(cur_x**2 + cur_y**2)
+            azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
+        else:
+            # Linear interpolation in polar coordinates
+            azi = start_azi + (end_azi - start_azi) * progress
+            dist = start_dist + (end_dist - start_dist) * progress
+            azi = azi % 360  # Wrap for lookup
+
         dist = np.clip(dist, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
         return azi, dist
 
@@ -353,6 +361,33 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
             stereo_buffer = stereo_buffer / peak * 0.9
 
     return stereo_buffer
+
+
+class SpatialSound:
+    """Encapsulates a mono sound with spatial trajectory properties."""
+
+    def __init__(self, dry_mono, sr, start_dist, start_azi, end_dist, end_azi, is_circular=False):
+        self.dry_mono = dry_mono
+        self.sr = sr
+        self.start_dist = start_dist
+        self.start_azi = start_azi
+        self.end_dist = end_dist
+        self.end_azi = end_azi
+        self.is_circular = is_circular
+
+    def compute_stereo(self, hrir_cache=None, normalize=True):
+        """Computes the stereo audio based on the trajectory."""
+        return generate_moving_sound(
+            self.dry_mono,
+            self.sr,
+            self.start_azi,
+            self.start_dist,
+            self.end_azi,
+            self.end_dist,
+            hrir_cache=hrir_cache,
+            normalize=normalize,
+            is_circular=self.is_circular,
+        )
 
 
 if __name__ == "__main__":

@@ -298,9 +298,18 @@ def _spatialize_sound(args):
 
     sr = DEFAULT_SAMPLE_RATE
 
-    stereo_buffer = HRTF_convolver.generate_moving_sound(
-        dry_data=dry_mono, sr=sr, start_azi=start_azi, start_dist=start_dist, end_azi=end_azi, end_dist=end_dist, hrir_cache=wrapper, normalize=False
+    # Create SpatialSound object
+    sound = HRTF_convolver.SpatialSound(
+        dry_mono=dry_mono,
+        sr=sr,
+        start_dist=start_dist,
+        start_azi=start_azi,
+        end_dist=end_dist,
+        end_azi=end_azi,
+        is_circular=False,  # dataset.py currently only uses linear movement
     )
+
+    stereo_buffer = sound.compute_stereo(hrir_cache=wrapper, normalize=False)
     spatial_L = stereo_buffer[0]
     spatial_R = stereo_buffer[1]
 
