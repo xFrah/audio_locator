@@ -11,9 +11,15 @@ from tqdm import tqdm
 from scipy.signal import fftconvolve
 
 from convert_wav import (
-    DEFAULT_SAMPLE_RATE, DEFAULT_N_FFT, DEFAULT_HOP_LENGTH,
-    DEFAULT_WINDOW_SIZE_SECONDS, DEFAULT_GCC_MAX_TAU,
-    DEFAULT_FREQ_BINS, NUM_SPATIAL_CHANNELS, NUM_GCC_CHANNELS, compute_spatial_features,
+    DEFAULT_SAMPLE_RATE,
+    DEFAULT_N_FFT,
+    DEFAULT_HOP_LENGTH,
+    DEFAULT_WINDOW_SIZE_SECONDS,
+    DEFAULT_GCC_MAX_TAU,
+    DEFAULT_FREQ_BINS,
+    NUM_SPATIAL_CHANNELS,
+    NUM_GCC_CHANNELS,
+    compute_spatial_features,
 )
 
 # Initialize persistent pool globally using all available cores minus one
@@ -27,20 +33,18 @@ RMS_WINDOW_DURATION = 0.05  # 50ms for instantaneous intensity
 slab.set_default_samplerate(DEFAULT_SAMPLE_RATE)
 
 
-
-
 # ============================================================
 # Caches (module-level, persist across epochs)
 # ============================================================
 
-_wav_paths_cache = {}        # sounds_dir -> list[str]
-_audio_cache = {}            # wav_path -> np.ndarray (samples,)  mono at target sr
+_wav_paths_cache = {}  # sounds_dir -> list[str]
+_audio_cache = {}  # wav_path -> np.ndarray (samples,)  mono at target sr
 
 # Shared Memory for HRIRs
 HRIR_CACHE_PATH = "hrir_cache.pkl"
 _hrir_shm = None
-_hrir_shm_meta = None # dict: (azi, dist) -> (offset_L, offset_R, length)
-_hrir_shm_array = None # ndarray mapped to shared memory
+_hrir_shm_meta = None  # dict: (azi, dist) -> (offset_L, offset_R, length)
+_hrir_shm_array = None  # ndarray mapped to shared memory
 
 
 def _get_wav_paths(sounds_dir):
@@ -76,6 +80,7 @@ def preload_audio(sounds_dir, sr=DEFAULT_SAMPLE_RATE):
 
 HRIR_CACHE_PATH = "hrir_cache.pkl"
 
+
 def _compute_hrir_worker(args):
     """Worker: compute HRIR for a specific azimuth and distance."""
     azi_deg, dist_m, room_size, listener_pos = args
@@ -85,8 +90,8 @@ def _compute_hrir_worker(args):
     hrir_data = hrir.data  # (n_taps, 2)
     return float(azi_deg), round(dist_m, 2), hrir_data[:, 0].copy(), hrir_data[:, 1].copy()
 
-def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
-                         room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
+
+def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None, room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
     """Precompute HRIRs on a grid and cache them (disk + memory)."""
     global _hrir_shm, _hrir_shm_meta, _hrir_shm_array
 
@@ -95,14 +100,14 @@ def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
         lx, ly, _ = listener_pos
         rx, ry, _ = room_size
         max_distance = min(lx, rx - lx, ly, ry - ly)
-    
+
     if dist_steps is None:
         dist_steps = np.linspace(0.3, max_distance, 40).tolist()
 
     # 360 degrees / 0.5 step = 720 azi steps
     num_azi_steps = int(360 / azi_step)
     total = num_azi_steps * len(dist_steps)
-    
+
     local_cache = {}
 
     # Try loading from disk first
@@ -115,12 +120,11 @@ def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
     # Check if we already have everything
     # Need to generate float sequence since range doesn't support floats
     azi_range = np.arange(0, 360, azi_step)
-    already_cached = sum(1 for a in azi_range
-                         for d in dist_steps if (float(a), round(d, 2)) in local_cache)
-                         
+    already_cached = sum(1 for a in azi_range for d in dist_steps if (float(a), round(d, 2)) in local_cache)
+
     if already_cached < total:
         print(f"Precomputing HRIR grid ({num_azi_steps} azimuths × {len(dist_steps)} distances = {total} positions)...")
-        
+
         # Identify missing coordinates
         missing_jobs = []
         for azi_deg in azi_range:
@@ -128,15 +132,14 @@ def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
                 key = (float(azi_deg), round(dist_m, 2))
                 if key not in local_cache:
                     missing_jobs.append((float(azi_deg), float(dist_m), room_size, listener_pos))
-                    
+
         if missing_jobs:
             global _persistent_pool
-            results = tqdm(_persistent_pool.map(_compute_hrir_worker, missing_jobs, chunksize=50),
-                           total=len(missing_jobs), desc="Generating HRIRs", leave=False)
-        
+            results = tqdm(_persistent_pool.map(_compute_hrir_worker, missing_jobs, chunksize=50), total=len(missing_jobs), desc="Generating HRIRs", leave=False)
+
             for azi_deg, dist_m, hrir_L, hrir_R in results:
                 local_cache[(azi_deg, dist_m)] = (hrir_L, hrir_R)
-        
+
             # Save to disk
             with open(HRIR_CACHE_PATH, "wb") as f:
                 pickle.dump(local_cache, f)
@@ -145,7 +148,7 @@ def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
     # Move to Shared Memory if not already initialized
     if _hrir_shm is None and local_cache:
         print("Setting up shared memory for HRIR cache...")
-        
+
         # Determine total size needed
         total_floats = 0
         tap_length = 0
@@ -153,9 +156,9 @@ def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
             if tap_length == 0:
                 tap_length = len(hL)
             total_floats += len(hL) + len(hR)
-            
-        nbytes = total_floats * 4 # float32
-        
+
+        nbytes = total_floats * 4  # float32
+
         # Create shared memory block
         try:
             # Try to attach if it exists from previous crashed run
@@ -164,41 +167,39 @@ def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None,
             _hrir_shm.unlink()
         except FileNotFoundError:
             pass
-            
+
         _hrir_shm = shared_memory.SharedMemory(name="hrir_cache_shm", create=True, size=nbytes)
         _hrir_shm_array = np.ndarray((total_floats,), dtype=np.float32, buffer=_hrir_shm.buf)
         _hrir_shm_meta = {}
-        
+
         offset = 0
         for k, (hL, hR) in local_cache.items():
             length = len(hL)
-            
+
             # Write L
             _hrir_shm_array[offset : offset + length] = hL
             off_L = offset
             offset += length
-            
+
             # Write R
             _hrir_shm_array[offset : offset + length] = hR
             off_R = offset
             offset += length
-            
+
             _hrir_shm_meta[k] = (off_L, off_R, length)
-            
+
         print(f"HRIR Shared Memory initialized. Size: {nbytes / 1024 / 1024:.2f} MB")
 
 
-
-def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=None,
-                 room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5], shm_meta=None):
+def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=None, room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5], shm_meta=None):
     """Find nearest cached HRIR for given azimuth and distance."""
     global _hrir_shm, _hrir_shm_array, _hrir_shm_meta
-    
+
     # Worker initialization of shared memory wrapper
     if _hrir_shm_meta is None and shm_meta is not None:
         _hrir_shm_meta = shm_meta
         _hrir_shm = shared_memory.SharedMemory(name="hrir_cache_shm", create=False)
-        
+
         # Calculate size based on first item
         total_floats = 0
         for k, (off_L, off_R, length) in _hrir_shm_meta.items():
@@ -225,13 +226,14 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=No
     off_L, off_R, length = _hrir_shm_meta[(azi_snapped, dist_snapped)]
     hrir_L = _hrir_shm_array[off_L : off_L + length]
     hrir_R = _hrir_shm_array[off_R : off_R + length]
-    
+
     return hrir_L, hrir_R
 
 
 # ============================================================
 # Worker for feature computation (multiprocessing)
 # ============================================================
+
 
 def _compute_spectrogram(args):
     """Worker: compute spatial features for one window from shared memory."""
@@ -245,8 +247,11 @@ def _compute_spectrogram(args):
     shm.close()
 
     spatial_features, gcc_features = compute_spatial_features(
-        ch0, ch1,
-        sr=sr, n_fft=n_fft, hop_length=hop_length,
+        ch0,
+        ch1,
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=hop_length,
         n_gcc_bins=n_gcc_bins,
     )  # (4, F_max, T) and (1, n_gcc_bins, T)
 
@@ -255,77 +260,49 @@ def _compute_spectrogram(args):
 
 def _spatialize_sound(args):
     """Worker: convolve mono sound with HRIR and add to shared memory buffer."""
-    (idx, wav_path, start_azi, start_dist, end_azi, end_dist, max_distance,
-     room_size, listener_pos, start_sample, shm_name, buf_shape, seed, hrir_shm_meta) = args
+    (idx, wav_path, start_azi, start_dist, end_azi, end_dist, max_distance, room_size, listener_pos, start_sample, shm_name, buf_shape, seed, hrir_shm_meta) = args
 
     # Reseed to ensure different randomness if needed (though we pass explicit params here)
     np.random.seed(seed)
 
     dry_mono = wav_path  # args can contain the data directly
-    n_samples = len(dry_mono)
 
-    # Check if stationary (or close enough)
-    is_stationary = (abs(start_azi - end_azi) < 0.5) and (abs(start_dist - end_dist) < 0.1)
+    # Initialize shared memory for HRIR if not already
+    global _hrir_shm, _hrir_shm_array, _hrir_shm_meta
 
-    if is_stationary:
-        # --- Fast Path: Static Convolution ---
-        hrir_L, hrir_R = _lookup_hrir(start_azi, start_dist, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos, shm_meta=hrir_shm_meta)
-        spatial_L = fftconvolve(dry_mono, hrir_L, mode="full")
-        spatial_R = fftconvolve(dry_mono, hrir_R, mode="full")
-    
-    else:
-        # --- Dynamic Path: Block-based Overlap-Add ---
-        block_size = 2048
-        # HRIR length (assumed constant)
-        dummy_L, _ = _lookup_hrir(0, 1.0, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos, shm_meta=hrir_shm_meta)
-        hrir_len = len(dummy_L)
-        
-        out_len = n_samples + hrir_len - 1
-        spatial_L = np.zeros(out_len, dtype=np.float32)
-        spatial_R = np.zeros(out_len, dtype=np.float32)
+    if _hrir_shm_meta is None and hrir_shm_meta is not None:
+        _hrir_shm_meta = hrir_shm_meta
+        _hrir_shm = shared_memory.SharedMemory(name="hrir_cache_shm", create=False)
+        total_floats = 0
+        for k, (off_L, off_R, length) in _hrir_shm_meta.items():
+            total_floats += 2 * length
+        _hrir_shm_array = np.ndarray((total_floats,), dtype=np.float32, buffer=_hrir_shm.buf)
 
-        for b_start in range(0, n_samples, block_size):
-            b_end = min(b_start + block_size, n_samples)
-            block = dry_mono[b_start:b_end]
-            
-            # Calculate position at center of block
-            # (Linear interpolation in Cartesian space for straight lines)
-            t_center = (b_start + b_end) / 2 / n_samples
-            
-            # Convert start/end to Cartesian
-            # Convention: x = d*sin(azi), y = d*cos(azi) (Clockwise from North)
-            # rad
-            sa_rad = np.radians(start_azi)
-            ea_rad = np.radians(end_azi)
-            
-            sx, sy = start_dist * np.sin(sa_rad), start_dist * np.cos(sa_rad)
-            ex, ey = end_dist * np.sin(ea_rad), end_dist * np.cos(ea_rad)
-            
-            # Interpolate
-            cur_x = sx + (ex - sx) * t_center
-            cur_y = sy + (ey - sy) * t_center
-            
-            # Convert back to Polar
-            curr_dist = np.sqrt(cur_x**2 + cur_y**2)
-            # atan2(x, y) for (sin, cos) convention
-            curr_azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
-            
-            # Lookup HRIR for this block
-            h_L, h_R = _get_interpolated_hrir(curr_azi, curr_dist, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos, shm_meta=hrir_shm_meta)
-            
-            # Convolve
-            # mode='full' gives length N + M - 1
-            conv_L = fftconvolve(block, h_L, mode="full")
-            conv_R = fftconvolve(block, h_R, mode="full")
-            
-            # Overlap-add
-            l_conv = len(conv_L)
-            target_end = min(b_start + l_conv, len(spatial_L))
-            write_len = target_end - b_start
-            
-            if write_len > 0:
-                spatial_L[b_start : target_end] += conv_L[:write_len]
-                spatial_R[b_start : target_end] += conv_R[:write_len]
+    import HRTF_convolver
+    from convert_wav import DEFAULT_SAMPLE_RATE
+
+    class HRIRDictWrapper:
+        def __init__(self, meta, array):
+            self.meta = meta
+            self.array = array
+
+        def __getitem__(self, key):
+            off_L, off_R, length = self.meta[key]
+            return self.array[off_L : off_L + length].copy(), self.array[off_R : off_R + length].copy()
+
+        def values(self):
+            for off_L, off_R, length in self.meta.values():
+                yield self.array[off_L : off_L + length], self.array[off_R : off_R + length]
+
+    wrapper = HRIRDictWrapper(_hrir_shm_meta, _hrir_shm_array)
+
+    sr = DEFAULT_SAMPLE_RATE
+
+    stereo_buffer = HRTF_convolver.generate_moving_sound(
+        dry_data=dry_mono, sr=sr, start_azi=start_azi, start_dist=start_dist, end_azi=end_azi, end_dist=end_dist, hrir_cache=wrapper, normalize=False
+    )
+    spatial_L = stereo_buffer[0]
+    spatial_R = stereo_buffer[1]
 
     return idx, start_sample, spatial_L, spatial_R
 
@@ -341,22 +318,24 @@ _stereo_buffer_template = None  # pre-allocated zeros buffer
 _shm = None  # persistent shared memory block
 
 
-def generate_epoch(total_duration_seconds=300,
-                   num_sounds=50,
-                   window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS,
-                   update_interval_ms=100,
-                   sr=DEFAULT_SAMPLE_RATE,
-                   n_fft=DEFAULT_N_FFT,
-                   hop_length=DEFAULT_HOP_LENGTH,
-                   azi_bins=180,
-                   room_size=[10.0, 10.0, 3.0],
-                   listener_pos=[5.0, 5.0, 1.5],
-                   sigma_deg=13.0,
-                   sounds_dir=r"sounds\sounds",
-                   # num_workers=14,
-                   num_workers=8,
-                   moving_prob=0.5,       # Probability that a sound moves
-                   max_velocity=90.0):    # Max velocity in degrees/second
+def generate_epoch(
+    total_duration_seconds=300,
+    num_sounds=50,
+    window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS,
+    update_interval_ms=100,
+    sr=DEFAULT_SAMPLE_RATE,
+    n_fft=DEFAULT_N_FFT,
+    hop_length=DEFAULT_HOP_LENGTH,
+    azi_bins=180,
+    room_size=[10.0, 10.0, 3.0],
+    listener_pos=[5.0, 5.0, 1.5],
+    sigma_deg=13.0,
+    sounds_dir=r"sounds\sounds",
+    # num_workers=14,
+    num_workers=8,
+    moving_prob=0.5,  # Probability that a sound moves
+    max_velocity=90.0,
+):  # Max velocity in degrees/second
     """Generate a fresh random dataset in memory using cached HRIRs and audio.
 
     Returns:
@@ -364,13 +343,12 @@ def generate_epoch(total_duration_seconds=300,
         chunks_gcc: np.ndarray of shape (num_windows, NUM_GCC_CHANNELS, n_gcc_bins, T)
         labels: np.ndarray of shape (num_windows, azi_bins)
         metadata_list: list of list of dicts (one list per window, containing metadata for active sounds)
+        stereo_buffer: np.ndarray of shape (2, total_samples)
     """
     global _initialized, _filtered_wav_files, _cached_T, _persistent_pool, _shm
 
     if num_workers is None:
         num_workers = max(1, os.cpu_count() - 1)
-
-
 
     # Calculate dynamic max distance from room boundaries (closest wall)
     lx, ly, _ = listener_pos
@@ -387,8 +365,7 @@ def generate_epoch(total_duration_seconds=300,
 
         # Precompute T (number of STFT time frames)
         window_samples = int(window_size_seconds * sr)
-        dummy_stft = librosa.stft(np.zeros(window_samples, dtype=np.float32),
-                                  n_fft=n_fft, hop_length=hop_length)
+        dummy_stft = librosa.stft(np.zeros(window_samples, dtype=np.float32), n_fft=n_fft, hop_length=hop_length)
         _cached_T = dummy_stft.shape[1]
 
         _initialized = True
@@ -396,7 +373,6 @@ def generate_epoch(total_duration_seconds=300,
 
     wav_files = _filtered_wav_files
     T = _cached_T
-
 
     # --- Ensure shared memory block exists for this epoch size ---
     total_samples = int(total_duration_seconds * sr)
@@ -413,13 +389,12 @@ def generate_epoch(total_duration_seconds=300,
     stereo_buffer = np.ndarray(buf_shape, dtype=np.float64, buffer=_shm.buf)
     stereo_buffer[:] = 0
 
-
     # --- 1. Spatialize in parallel (Batched to save RAM) ---
     # We process sounds in batches to avoid creating a massive list of jobs that consumes RAM
     # (15k sounds * 1MB per sound = 15GB list overhead)
     batch_size = 1000  # Process 1000 sounds at a time
-    events = []        # (start, end, azi_deg)
-    
+    events = []  # (start, end, azi_deg)
+
     # Pre-allocate list for sound data (will be filled by index)
     # We still need this for intensity calculation, but it stores just the small arrays
     sound_data_list = [None] * num_sounds
@@ -428,10 +403,10 @@ def generate_epoch(total_duration_seconds=300,
 
     for batch_start in range(0, num_sounds, batch_size):
         batch_end = min(batch_start + batch_size, num_sounds)
-        
+
         spat_jobs = []
         batch_indices = range(batch_start, batch_end)
-        
+
         for i in batch_indices:
             wav_path = random.choice(wav_files)
             max_start = max(0, total_samples - int(5 * sr))
@@ -441,41 +416,41 @@ def generate_epoch(total_duration_seconds=300,
             try:
                 dry_mono = _audio_cache[wav_path]
                 duration_sec = len(dry_mono) / sr
-                
+
                 # Movement logic
                 # Movement logic: Vector-based
                 start_azi = random.uniform(0, 360)
                 # Distance distribution: Mostly 2-4m, few near 0.
                 # Triangular distribution peaking at 3.5m (assuming max~5)
                 start_dist = random.triangular(0.5, max_distance, 3.5)
-                
+
                 # Convert to Cartesian
                 sa_rad = np.radians(start_azi)
                 sx = start_dist * np.sin(sa_rad)
                 sy = start_dist * np.cos(sa_rad)
-                
+
                 end_azi = start_azi
                 end_dist = start_dist
 
                 if random.random() < moving_prob and duration_sec > 0.5:
                     # Random velocity vector
                     move_heading = random.uniform(0, 360)
-                    speed = random.uniform(0.5, 3.0) # m/s (Reasonable walking/running speed)
-                    
+                    speed = random.uniform(0.5, 3.0)  # m/s (Reasonable walking/running speed)
+
                     # Velocity components
                     mh_rad = np.radians(move_heading)
                     vx = speed * np.sin(mh_rad)
                     vy = speed * np.cos(mh_rad)
-                    
+
                     # Unclamped end pos
                     ex = sx + vx * duration_sec
                     ey = sy + vy * duration_sec
-                    
+
                     # Clamp to max_distance
                     # Ray-circle intersection? Or just scale vector?
                     # Since we start inside, we just need to check if we exit.
                     final_dist = np.sqrt(ex**2 + ey**2)
-                    
+
                     if final_dist > max_distance:
                         # We went out of bounds. Find intersection point.
                         # We want t such that |start + v*t| = max_dist
@@ -502,7 +477,7 @@ def generate_epoch(total_duration_seconds=300,
                         ex *= scale
                         ey *= scale
                         final_dist = max_distance
-                        
+
                     # Convert end back to polar
                     end_dist = final_dist
                     end_azi = np.degrees(np.arctan2(ex, ey)) % 360
@@ -512,19 +487,28 @@ def generate_epoch(total_duration_seconds=300,
                     end_dist = start_dist
 
                 # Pack job (removed hrir_L/R from args, worker looks them up)
-                spat_jobs.append((i, dry_mono, start_azi, start_dist, end_azi, end_dist, max_distance,
-                                  room_size, listener_pos, start_sample, _shm.name, buf_shape, random.randint(0, 999999), _hrir_shm_meta))
-                
+                spat_jobs.append(
+                    (
+                        i,
+                        dry_mono,
+                        start_azi,
+                        start_dist,
+                        end_azi,
+                        end_dist,
+                        max_distance,
+                        room_size,
+                        listener_pos,
+                        start_sample,
+                        _shm.name,
+                        buf_shape,
+                        random.randint(0, 999999),
+                        _hrir_shm_meta,
+                    )
+                )
+
                 # Store event metadata
                 # For moving sounds, we need start/end azi to interpolate labels
-                events.append({
-                    'start_sample': start_sample,
-                    'idx': i,
-                    'start_azi': start_azi,
-                    'end_azi': end_azi,
-                    'start_dist': start_dist,
-                    'end_dist': end_dist
-                })
+                events.append({"start_sample": start_sample, "idx": i, "start_azi": start_azi, "end_azi": end_azi, "start_dist": start_dist, "end_dist": end_dist})
             except Exception:
                 continue
 
@@ -538,11 +522,11 @@ def generate_epoch(total_duration_seconds=300,
         for i, start_sample, spatial_L, spatial_R in spat_iterator:
             end_sample = min(start_sample + len(spatial_L), total_samples)
             length = end_sample - start_sample
-            
+
             if length > 0:
                 stereo_buffer[0, start_sample:end_sample] += spatial_L[:length]
                 stereo_buffer[1, start_sample:end_sample] += spatial_R[:length]
-                
+
                 # Find the event for this index and update end
                 # (Note: events list grows sequentially, so i usually matches index if no skips)
                 # But safer to just store them in a dict or update by scanning?
@@ -551,14 +535,14 @@ def generate_epoch(total_duration_seconds=300,
                 # Since we append sequentially in the job loop, the last N events correspond to this batch.
                 # Wait, 'i' is the absolute sound index.
                 # Let's just trust that we appended an event for every job.
-                
+
                 # Store sound data for intensity
                 sound_data_list[i] = (spatial_L[:length], spatial_R[:length])
-                
+
                 # Update event end sample. We can't easily find the dict in the list by 'i' efficiently.
                 # Optim: Store events in a dict temporarily?
                 pass
-            
+
             overall_pbar.update(1)
 
     overall_pbar.close()
@@ -568,15 +552,15 @@ def generate_epoch(total_duration_seconds=300,
     # Let's fix the events list structure:
     # We only have 'start', 'azi', 'idx' in events.
     # We can infer 'end' from sound_data_list[idx] length.
-    
+
     final_events = []
     for evt in events:
-        idx = evt['idx']
+        idx = evt["idx"]
         if sound_data_list[idx] is not None:
             s_L, _ = sound_data_list[idx]
-            evt['end_sample'] = evt['start_sample'] + len(s_L)
+            evt["end_sample"] = evt["start_sample"] + len(s_L)
             final_events.append(evt)
-            
+
     events = final_events
     sound_data = sound_data_list
 
@@ -584,7 +568,6 @@ def generate_epoch(total_duration_seconds=300,
     peak = np.max(np.abs(stereo_buffer))
     if peak > 0:
         stereo_buffer = stereo_buffer / peak * 0.9
-
 
     # --- 2. Compute spatial features in parallel ---
     window_samples = int(window_size_seconds * sr)
@@ -605,13 +588,11 @@ def generate_epoch(total_duration_seconds=300,
     chunks_spatial = np.zeros((num_windows, NUM_SPATIAL_CHANNELS, F_max, T), dtype=np.float32)
     chunks_gcc = np.zeros((num_windows, NUM_GCC_CHANNELS, n_gcc_bins, T), dtype=np.float32)
 
-    results = tqdm(_persistent_pool.map(_compute_spectrogram, spec_jobs, chunksize=32),
-                        total=num_windows, desc="Features", leave=False)
+    results = tqdm(_persistent_pool.map(_compute_spectrogram, spec_jobs, chunksize=32), total=num_windows, desc="Features", leave=False)
 
     for win_idx, spec, gcc in results:
         chunks_spatial[win_idx] = spec
         chunks_gcc[win_idx] = gcc
-
 
     # --- 3. Labels with intensity-scaled blobs ---
     rms_window_samples = int(RMS_WINDOW_DURATION * sr)
@@ -623,25 +604,25 @@ def generate_epoch(total_duration_seconds=300,
     for win_idx in range(num_windows):
         win_start = win_idx * hop_samples
         win_end = win_start + window_samples
-        
+
         # New logic: Check for sounds active at the EXACT end of the window
         active_events = []
-        min_samples = int(0.070 * sr) # 70 ms constraint
-        
+        min_samples = int(0.070 * sr)  # 70 ms constraint
+
         for ev in events:
             # Check if the sound covers the instant 'win_end'
             # (start < win_end <= end)
-            if ev['start_sample'] < win_end <= ev['end_sample']:
-                
+            if ev["start_sample"] < win_end <= ev["end_sample"]:
+
                 # Additional Constraint: Must appear for at least 70ms in this window
                 # Since it's active at win_end, the overlap end is win_end.
                 # Overlap start is max(win_start, ev['start_sample'])
-                overlap_start = max(win_start, ev['start_sample'])
+                overlap_start = max(win_start, ev["start_sample"])
                 duration_in_window = win_end - overlap_start
-                
+
                 if duration_in_window >= min_samples:
                     active_events.append(ev)
-        
+
         if not active_events:
             continue
 
@@ -649,31 +630,31 @@ def generate_epoch(total_duration_seconds=300,
             # Calculate instantaneous RMS at win_end
             # Extract segment ending at win_end
             # We need to look up data in sound_data (which has the full spatialized sound)
-            s_L, s_R = sound_data[ev['idx']]
-            
+            s_L, s_R = sound_data[ev["idx"]]
+
             # Map win_end to local index in the sound array
-            local_end_idx = win_end - ev['start_sample']
+            local_end_idx = win_end - ev["start_sample"]
             local_start_idx = max(0, local_end_idx - rms_window_samples)
-            
+
             # If segment is valid
             if local_end_idx > 0:
-                seg_L = s_L[local_start_idx : local_end_idx]
-                seg_R = s_R[local_start_idx : local_end_idx]
-                
+                seg_L = s_L[local_start_idx:local_end_idx]
+                seg_R = s_R[local_start_idx:local_end_idx]
+
                 if len(seg_L) > 0:
-                    seg_rms = np.sqrt(np.mean(np.concatenate([seg_L, seg_R])**2))
+                    seg_rms = np.sqrt(np.mean(np.concatenate([seg_L, seg_R]) ** 2))
                     if seg_rms < 1e-4:  # effectively silent
                         continue
-                        
+
                     # Calculate spectral centroid using slab
                     mono_seg = (seg_L + seg_R) * 0.5
                     # try:
                     temp_sound = slab.Sound(data=mono_seg, samplerate=sr)
-                    centroid_feat = temp_sound.spectral_feature('centroid')
+                    centroid_feat = temp_sound.spectral_feature("centroid")
                     centroid = float(centroid_feat[0] if isinstance(centroid_feat, (list, np.ndarray)) else centroid_feat)
                     # except Exception:
                     #     centroid = 1000.0
-                        
+
                     # Map centroid to a physical radius (meters)
                     # Bass (< 100 Hz) gets a large radius, high (> 4000 Hz) gets a small radius
                     f_min = 100.0
@@ -682,84 +663,89 @@ def generate_epoch(total_duration_seconds=300,
                     log_f = np.log10(centroid_clipped)
                     log_min = np.log10(f_min)
                     log_max = np.log10(f_max)
-                    
+
                     progress_f = (log_f - log_min) / (log_max - log_min)
-                    
+
                     r_max = 2.5  # Max radius for bass
                     r_min = 0.2  # Min radius for high frequencies
                     radius = r_max - progress_f * (r_max - r_min)
-                
+
                     # Calculate Azimuth and Distance at win_end
-                    progress = (win_end - ev['start_sample']) / (ev['end_sample'] - ev['start_sample'])
+                    progress = (win_end - ev["start_sample"]) / (ev["end_sample"] - ev["start_sample"])
                     progress = np.clip(progress, 0.0, 1.0)
-                    
+
                     # Use Cartesian interpolation to match spatialization logic
-                    sa_rad = np.radians(ev['start_azi'])
-                    ea_rad = np.radians(ev['end_azi'])
-                    sx, sy = ev['start_dist'] * np.sin(sa_rad), ev['start_dist'] * np.cos(sa_rad)
-                    ex, ey = ev['end_dist'] * np.sin(ea_rad), ev['end_dist'] * np.cos(ea_rad)
-                    
+                    sa_rad = np.radians(ev["start_azi"])
+                    ea_rad = np.radians(ev["end_azi"])
+                    sx, sy = ev["start_dist"] * np.sin(sa_rad), ev["start_dist"] * np.cos(sa_rad)
+                    ex, ey = ev["end_dist"] * np.sin(ea_rad), ev["end_dist"] * np.cos(ea_rad)
+
                     cur_x = sx + (ex - sx) * progress
                     cur_y = sy + (ey - sy) * progress
-                    
+
                     current_dist = np.sqrt(cur_x**2 + cur_y**2)
                     current_azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
-                    
+
                     # Compute angular width based on distance and radius from listener perspective
                     if current_dist <= radius:
                         width_deg = 180.0
                     else:
                         half_angle_rad = np.arcsin(radius / current_dist)
                         width_deg = 2.0 * np.degrees(half_angle_rad)
-                        
+
                     width_bins = max(1, int(round(width_deg / 360 * azi_bins)))
-                    
+
                     azi_idx = round(current_azi / 360 * azi_bins) % azi_bins
-                    
+
                     # Accumulate (flat top + gaussian tails)
                     azi_idx_float = current_azi / 360 * azi_bins
                     width_bins_half = width_deg / 360 * azi_bins / 2.0
                     sigma_bins = max(0.1, sigma_deg / 360 * azi_bins)
-                    
+
                     for idx in range(azi_bins):
                         # Circular discrete distance
                         dist = min(abs(idx - azi_idx_float), azi_bins - abs(idx - azi_idx_float))
                         if dist <= width_bins_half:
                             val = 1.0
                         else:
-                            val = np.exp(-((dist - width_bins_half)**2) / (2 * sigma_bins**2))
+                            val = np.exp(-((dist - width_bins_half) ** 2) / (2 * sigma_bins**2))
                         labels[win_idx, idx] = max(labels[win_idx, idx], val)
-                    
+
                     # Store metadata for visualization
                     # We want to know: ID, Trajectory (Start->End), Current Pos, Timing, Radius, Width
-                    metadata_list[win_idx].append({
-                        'id': ev['idx'],
-                        'start_sample': ev['start_sample'],
-                        'end_sample': ev['end_sample'],
-                        'traj_start': (ev['start_azi'], ev['start_dist']),
-                        'traj_end': (ev['end_azi'], ev['end_dist']),
-                        'current_pos': (current_azi, current_dist), 
-                        'win_range': (win_start, win_end),
-                        'radius': radius,
-                        'width_deg': width_deg
-                    })
-    
+                    metadata_list[win_idx].append(
+                        {
+                            "id": ev["idx"],
+                            "start_sample": ev["start_sample"],
+                            "end_sample": ev["end_sample"],
+                            "traj_start": (ev["start_azi"], ev["start_dist"]),
+                            "traj_end": (ev["end_azi"], ev["end_dist"]),
+                            "current_pos": (current_azi, current_dist),
+                            "win_range": (win_start, win_end),
+                            "radius": radius,
+                            "width_deg": width_deg,
+                        }
+                    )
+
     # Filter out silent windows (where max label is 0)
     # We only want to train on windows that have at least one active sound
     has_active_sound = labels.max(axis=1) > 0
     chunks_spatial = chunks_spatial[has_active_sound]
     chunks_gcc = chunks_gcc[has_active_sound]
     labels = labels[has_active_sound]
-    
+
     # Filter metadata list
     metadata_list = [m for i, m in enumerate(metadata_list) if has_active_sound[i]]
 
-    return chunks_spatial, chunks_gcc, labels, metadata_list
+    return chunks_spatial, chunks_gcc, labels, metadata_list, stereo_buffer.copy()
 
 
 # --- CLI: quick test ---
 if __name__ == "__main__":
-    chunks_spatial, chunks_gcc, labels, meta = generate_epoch(
+    import soundfile as sf
+    from convert_wav import DEFAULT_SAMPLE_RATE
+
+    chunks_spatial, chunks_gcc, labels, meta, stereo_buffer = generate_epoch(
         total_duration_seconds=60,
         num_sounds=30,
         update_interval_ms=2000,
@@ -768,3 +754,8 @@ if __name__ == "__main__":
     print(f"Chunks GCC: {chunks_gcc.shape}")
     print(f"Labels: {labels.shape}")
     print(f"Label range: [{labels.min():.4f}, {labels.max():.4f}]")
+
+    output_wav = "debug_epoch_raw_audio.wav"
+    print(f"Saving raw stereo buffer to {output_wav} so you can check if it sounds good...")
+    sf.write(output_wav, stereo_buffer.T, DEFAULT_SAMPLE_RATE)
+    print("Done!")

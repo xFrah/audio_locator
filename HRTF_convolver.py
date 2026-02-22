@@ -249,25 +249,29 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=No
     return hrir_L, hrir_R
 
 
-def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist):
+def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist, hrir_cache=None, normalize=True):
     import random
     from convert_wav import DEFAULT_SAMPLE_RATE
 
     n_samples = len(dry_data)
     duration_sec = n_samples / sr
 
-    global _hrir_shm_meta
-    if _hrir_shm_meta is None:
-        raise RuntimeError("HRIR cache not initialized. Call load_hrir_cache() first.")
+    if hrir_cache is None:
+        global _hrir_shm_meta
+        if _hrir_shm_meta is None:
+            raise RuntimeError("HRIR cache not initialized. Call load_hrir_cache() first or pass arguably to hrir_cache.")
+        hrir_cache = _hrir_shm_meta
 
-    M = max(len(h_L) for h_L, h_R in _hrir_shm_meta.values())
+    first_val = next(iter(hrir_cache.values()))
+    if len(first_val) == 3:  # In case of shared memory meta (off_L, off_R, length)
+        M = first_val[2]
+    else:
+        M = len(first_val[0])
     L = 512  # Window size for the input chunk
 
     out_length = n_samples + M - 1
     spatial_L = np.zeros(out_length, dtype=np.float32)
     spatial_R = np.zeros(out_length, dtype=np.float32)
-
-    print(f"Generating movement over {duration_sec:.2f} seconds using overlap-add...")
 
     cutoff_freq = 200.0
     dry_data_lp = butter_lp_filter(signal=dry_data, cutoff=cutoff_freq)
@@ -304,7 +308,7 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
         progress = (b_start + hop) / n_samples
         azi1, dist1 = get_pos(progress)
 
-        h_l_next, h_r_next = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=_hrir_shm_meta, azimuth=azi1, distance=dist1)
+        h_l_next, h_r_next = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=hrir_cache, azimuth=azi1, distance=dist1)
 
         conv_L_cross = fftconvolve(x_r, h_l_next, mode="full")
         conv_R_cross = fftconvolve(x_r, h_r_next, mode="full")
@@ -327,9 +331,11 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
             spatial_R[b_start:target_end] += conv_R_cross[:write_len_hp]
 
     stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
-    peak = np.max(np.abs(stereo_buffer))
-    if peak > 0:
-        stereo_buffer = stereo_buffer / peak * 0.9
+
+    if normalize:
+        peak = np.max(np.abs(stereo_buffer))
+        if peak > 0:
+            stereo_buffer = stereo_buffer / peak * 0.9
 
     return stereo_buffer
 
@@ -350,7 +356,7 @@ if __name__ == "__main__":
         dry_data = load_and_resample(audio_path, target_sr=sr)
 
         load_hrir_cache()
-        stereo_buffer = generate_moving_sound(dry_data, sr, start_azi=0, start_dist=2.0, end_azi=270, end_dist=2.0)
+        stereo_buffer = generate_moving_sound(dry_data, sr, start_azi=0, start_dist=3.0, end_azi=180, end_dist=3.0)
 
         print(f"Writing to {output_path}...")
         sf.write(output_path, stereo_buffer.T, sr)
