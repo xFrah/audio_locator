@@ -84,6 +84,22 @@ def evaluate_realtime(
     # --- Live Plot ---
     live_plot = LivePredictionPlot()
 
+    # --- Warmup ---
+    print("Warming up model and features...")
+    with torch.no_grad():
+        start_sample = 0
+        end_sample = window_samples
+        chunk = y[:, start_sample:end_sample]
+        spatial_features, gcc_features = compute_spatial_features(chunk[0], chunk[1], sr=sr, n_fft=DEFAULT_N_FFT, hop_length=DEFAULT_HOP_LENGTH, n_gcc_bins=DEFAULT_GCC_MAX_TAU)
+        x_spatial = torch.from_numpy(spatial_features).unsqueeze(0).to(device)
+        x_gcc = torch.from_numpy(gcc_features).unsqueeze(0).to(device)
+        for _ in range(3):
+            out = model(x_spatial, x_gcc)
+            _ = out.cpu().numpy()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    print("Warmup complete.")
+
     # --- Processing Loop (Simulating stream) ---
     with torch.no_grad():
         for i in range(num_windows):
