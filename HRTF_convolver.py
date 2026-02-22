@@ -250,7 +250,71 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=No
     return hrir_L, hrir_R
 
 
-def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist, hrir_cache=None, normalize=True, is_circular=False):
+def get_spatial_pos(
+    progress,
+    duration_sec,
+    start_azi,
+    start_dist,
+    end_azi,
+    end_dist,
+    is_circular=False,
+    velocity=None,
+):
+    """Calculates the (azimuth, distance) at a given progress [0, 1]."""
+    global DISTANCE_STEPS
+
+    progress = np.clip(progress, 0.0, 1.0)
+    t = progress * duration_sec
+
+    # Convert start/end to Cartesian for linear interpolation
+    sa_rad = np.radians(start_azi)
+    ea_rad = np.radians(end_azi)
+    sx, sy = start_dist * np.sin(sa_rad), start_dist * np.cos(sa_rad)
+    ex, ey = end_dist * np.sin(ea_rad), end_dist * np.cos(ea_rad)
+
+    if velocity is not None:
+        dist_moved = velocity * t
+        if not is_circular:
+            # Move along the vector from start to end
+            dx, dy = ex - sx, ey - sy
+            total_path_dist = np.sqrt(dx**2 + dy**2)
+            if total_path_dist > 1e-6:
+                cur_x = sx + (dx / total_path_dist) * dist_moved
+                cur_y = sy + (dy / total_path_dist) * dist_moved
+            else:
+                cur_x, cur_y = sx, sy
+
+            dist = np.sqrt(cur_x**2 + cur_y**2)
+            azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
+        else:
+            # Move along the arc
+            dist = start_dist + (end_dist - start_dist) * progress
+            angle_diff = end_azi - start_azi
+            if abs(angle_diff) < 1e-6:
+                azi = start_azi
+            else:
+                direction = 1.0 if angle_diff > 0 else -1.0
+                angular_delta_rad = dist_moved / max(dist, 0.1)
+                azi = start_azi + direction * np.degrees(angular_delta_rad)
+                azi = azi % 360
+    else:
+        # Traditional linear interpolation of progress
+        if not is_circular:
+            cur_x = sx + (ex - sx) * progress
+            cur_y = sy + (ey - sy) * progress
+            dist = np.sqrt(cur_x**2 + cur_y**2)
+            azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
+        else:
+            # Linear interpolation in polar coordinates
+            azi = start_azi + (end_azi - start_azi) * progress
+            dist = start_dist + (end_dist - start_dist) * progress
+            azi = azi % 360
+
+    dist = np.clip(dist, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
+    return azi, dist
+
+
+def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist, hrir_cache=None, normalize=True, is_circular=False, velocity=None):
     import random
     from convert_wav import DEFAULT_SAMPLE_RATE
 
@@ -306,22 +370,19 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
     sx, sy = start_dist * np.sin(sa_rad), start_dist * np.cos(sa_rad)
     ex, ey = end_dist * np.sin(ea_rad), end_dist * np.cos(ea_rad)
 
+    duration_sec = n_samples / sr
+
     def get_pos(progress):
-        progress = np.clip(progress, 0.0, 1.0)
-        if not is_circular:
-            cur_x = sx + (ex - sx) * progress
-            cur_y = sy + (ey - sy) * progress
-
-            dist = np.sqrt(cur_x**2 + cur_y**2)
-            azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
-        else:
-            # Linear interpolation in polar coordinates
-            azi = start_azi + (end_azi - start_azi) * progress
-            dist = start_dist + (end_dist - start_dist) * progress
-            azi = azi % 360  # Wrap for lookup
-
-        dist = np.clip(dist, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
-        return azi, dist
+        return get_spatial_pos(
+            progress,
+            duration_sec,
+            start_azi,
+            start_dist,
+            end_azi,
+            end_dist,
+            is_circular=is_circular,
+            velocity=velocity,
+        )
 
     for b_start in range(0, n_samples - window_size + 1, hop):
         b_end = b_start + window_size
@@ -366,7 +427,7 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
 class SpatialSound:
     """Encapsulates a mono sound with spatial trajectory properties."""
 
-    def __init__(self, dry_mono, sr, start_dist, start_azi, end_dist, end_azi, is_circular=False):
+    def __init__(self, dry_mono, sr, start_dist, start_azi, end_dist, end_azi, is_circular=False, velocity=None):
         self.dry_mono = dry_mono
         self.sr = sr
         self.start_dist = start_dist
@@ -374,6 +435,7 @@ class SpatialSound:
         self.end_dist = end_dist
         self.end_azi = end_azi
         self.is_circular = is_circular
+        self.velocity = velocity
 
     def compute_stereo(self, hrir_cache=None, normalize=True):
         """Computes the stereo audio based on the trajectory."""
@@ -387,6 +449,21 @@ class SpatialSound:
             hrir_cache=hrir_cache,
             normalize=normalize,
             is_circular=self.is_circular,
+            velocity=self.velocity,
+        )
+
+    def get_pos(self, progress):
+        """Calculates the (azimuth, distance) at a given progress [0, 1]."""
+        duration_sec = len(self.dry_mono) / self.sr
+        return get_spatial_pos(
+            progress,
+            duration_sec,
+            self.start_azi,
+            self.start_dist,
+            self.end_azi,
+            self.end_dist,
+            is_circular=self.is_circular,
+            velocity=self.velocity,
         )
 
 

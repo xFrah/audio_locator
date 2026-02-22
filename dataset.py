@@ -260,7 +260,24 @@ def _compute_spectrogram(args):
 
 def _spatialize_sound(args):
     """Worker: convolve mono sound with HRIR and add to shared memory buffer."""
-    (idx, wav_path, start_azi, start_dist, end_azi, end_dist, max_distance, room_size, listener_pos, start_sample, shm_name, buf_shape, seed, hrir_shm_meta) = args
+    (
+        idx,
+        wav_path,
+        start_azi,
+        start_dist,
+        end_azi,
+        end_dist,
+        is_circular,
+        velocity,
+        max_distance,
+        room_size,
+        listener_pos,
+        start_sample,
+        shm_name,
+        buf_shape,
+        seed,
+        hrir_shm_meta,
+    ) = args
 
     # Reseed to ensure different randomness if needed (though we pass explicit params here)
     np.random.seed(seed)
@@ -300,13 +317,7 @@ def _spatialize_sound(args):
 
     # Create SpatialSound object
     sound = HRTF_convolver.SpatialSound(
-        dry_mono=dry_mono,
-        sr=sr,
-        start_dist=start_dist,
-        start_azi=start_azi,
-        end_dist=end_dist,
-        end_azi=end_azi,
-        is_circular=False,  # dataset.py currently only uses linear movement
+        dry_mono=dry_mono, sr=sr, start_dist=start_dist, start_azi=start_azi, end_dist=end_dist, end_azi=end_azi, is_circular=is_circular, velocity=velocity
     )
 
     stereo_buffer = sound.compute_stereo(hrir_cache=wrapper, normalize=False)
@@ -442,56 +453,44 @@ def generate_epoch(
                 end_dist = start_dist
 
                 if random.random() < moving_prob and duration_sec > 0.5:
-                    # Random velocity vector
-                    move_heading = random.uniform(0, 360)
+                    is_circular = random.random() < 0.5
                     speed = random.uniform(0.5, 3.0)  # m/s (Reasonable walking/running speed)
 
-                    # Velocity components
-                    mh_rad = np.radians(move_heading)
-                    vx = speed * np.sin(mh_rad)
-                    vy = speed * np.cos(mh_rad)
+                    if not is_circular:
+                        # Random velocity vector (Linear)
+                        move_heading = random.uniform(0, 360)
 
-                    # Unclamped end pos
-                    ex = sx + vx * duration_sec
-                    ey = sy + vy * duration_sec
+                        # Velocity components
+                        mh_rad = np.radians(move_heading)
+                        vx = speed * np.sin(mh_rad)
+                        vy = speed * np.cos(mh_rad)
 
-                    # Clamp to max_distance
-                    # Ray-circle intersection? Or just scale vector?
-                    # Since we start inside, we just need to check if we exit.
-                    final_dist = np.sqrt(ex**2 + ey**2)
+                        # Unclamped end pos
+                        ex = sx + vx * duration_sec
+                        ey = sy + vy * duration_sec
 
-                    if final_dist > max_distance:
-                        # We went out of bounds. Find intersection point.
-                        # We want t such that |start + v*t| = max_dist
-                        # This works, but easier approximation: just clip the end point to boundary?
-                        # No, clipping dist changes direction.
-                        # We should shorten the path so it stops AT the boundary (or bounces, but let's just stop/slide).
-                        # Let's simple clip the distance of the end point? No that warps the path.
-                        # Let's scale the vector (ex, ey) to be on the circle? No.
-                        # Correct way: find intersection of line segment with circle.
-                        # But lazy way (good enough): normalize (ex, ey) to max_dist.
-                        # This effectively makes the sound "slide" along the wall if it was going straight out,
-                        # but changes trajectory if it was tangential.
-                        #
-                        # BETTER: Scale down the displacement so it ends at boundary?
-                        # No, that changes speed.
-                        #
-                        # SIMPLEST ROBUST: If end is OOB, retry with new randoms (rejection sampling).
-                        # But that might bias towards center.
-                        #
-                        # Let's just clip the end point to max radius direction-wise from center.
-                        # This is what "scale to max_dist" means.
-                        # It changes the physical path (curves it to center), but ensures validity.
-                        scale = max_distance / final_dist
-                        ex *= scale
-                        ey *= scale
-                        final_dist = max_distance
+                        final_dist = np.sqrt(ex**2 + ey**2)
+                        if final_dist > max_distance:
+                            scale = max_distance / final_dist
+                            ex *= scale
+                            ey *= scale
+                            final_dist = max_distance
 
-                    # Convert end back to polar
-                    end_dist = final_dist
-                    end_azi = np.degrees(np.arctan2(ex, ey)) % 360
+                        # Convert end back to polar
+                        end_dist = final_dist
+                        end_azi = np.degrees(np.arctan2(ex, ey)) % 360
+                    else:
+                        # Circular motion
+                        # We pick a target end_azi to indicate rotation direction
+                        # The actual movement is governed by velocity in compute_stereo
+                        direction = random.choice([-1.0, 1.0])
+                        # Just a hint for rotation direction in compute_stereo
+                        end_azi = start_azi + direction * 10
+                        end_dist = start_dist  # Keep constant distance for circular
                 else:
                     # Static
+                    is_circular = False
+                    speed = None
                     end_azi = start_azi
                     end_dist = start_dist
 
@@ -504,6 +503,8 @@ def generate_epoch(
                         start_dist,
                         end_azi,
                         end_dist,
+                        is_circular,
+                        speed,
                         max_distance,
                         room_size,
                         listener_pos,
@@ -517,7 +518,18 @@ def generate_epoch(
 
                 # Store event metadata
                 # For moving sounds, we need start/end azi to interpolate labels
-                events.append({"start_sample": start_sample, "idx": i, "start_azi": start_azi, "end_azi": end_azi, "start_dist": start_dist, "end_dist": end_dist})
+                events.append(
+                    {
+                        "start_sample": start_sample,
+                        "idx": i,
+                        "start_azi": start_azi,
+                        "end_azi": end_azi,
+                        "start_dist": start_dist,
+                        "end_dist": end_dist,
+                        "is_circular": is_circular,
+                        "speed": speed,
+                    }
+                )
             except Exception:
                 continue
 
@@ -679,21 +691,20 @@ def generate_epoch(
                     r_min = 0.2  # Min radius for high frequencies
                     radius = r_max - progress_f * (r_max - r_min)
 
-                    # Calculate Azimuth and Distance at win_end
+                    # Calculate Azimuth and Distance at win_end using the unified trajectory logic
                     progress = (win_end - ev["start_sample"]) / (ev["end_sample"] - ev["start_sample"])
-                    progress = np.clip(progress, 0.0, 1.0)
+                    duration_sec = (ev["end_sample"] - ev["start_sample"]) / sr
 
-                    # Use Cartesian interpolation to match spatialization logic
-                    sa_rad = np.radians(ev["start_azi"])
-                    ea_rad = np.radians(ev["end_azi"])
-                    sx, sy = ev["start_dist"] * np.sin(sa_rad), ev["start_dist"] * np.cos(sa_rad)
-                    ex, ey = ev["end_dist"] * np.sin(ea_rad), ev["end_dist"] * np.cos(ea_rad)
-
-                    cur_x = sx + (ex - sx) * progress
-                    cur_y = sy + (ey - sy) * progress
-
-                    current_dist = np.sqrt(cur_x**2 + cur_y**2)
-                    current_azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
+                    current_azi, current_dist = HRTF_convolver.get_spatial_pos(
+                        progress=progress,
+                        duration_sec=duration_sec,
+                        start_azi=ev["start_azi"],
+                        start_dist=ev["start_dist"],
+                        end_azi=ev["end_azi"],
+                        end_dist=ev["end_dist"],
+                        is_circular=ev["is_circular"],
+                        velocity=ev["speed"],
+                    )
 
                     # Compute angular width based on distance and radius from listener perspective
                     if current_dist <= radius:
@@ -733,6 +744,8 @@ def generate_epoch(
                             "win_range": (win_start, win_end),
                             "radius": radius,
                             "width_deg": width_deg,
+                            "is_circular": ev["is_circular"],
+                            "speed": ev["speed"],
                         }
                     )
 

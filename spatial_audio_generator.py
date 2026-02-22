@@ -33,8 +33,20 @@ if __name__ == "__main__":
 
     # 3. Create SpatialSound object for orbiting (circular) motion
     # From 0 to 360 * num_rotations
+    # We can calculate a velocity (v = omega * r) if we want it velocity-driven
+    # v = (2 * pi * num_rotations / duration) * distance
+    duration = len(dry_data) / DEFAULT_SAMPLE_RATE
+    orbit_velocity = (2 * np.pi * num_rotations / duration) * orbit_distance
+
     sound = SpatialSound(
-        dry_mono=dry_data, sr=DEFAULT_SAMPLE_RATE, start_dist=orbit_distance, start_azi=0.0, end_dist=orbit_distance, end_azi=360.0 * num_rotations, is_circular=True
+        dry_mono=dry_data,
+        sr=DEFAULT_SAMPLE_RATE,
+        start_dist=orbit_distance,
+        start_azi=0.0,
+        end_dist=orbit_distance,
+        end_azi=360.0 * num_rotations,
+        is_circular=True,
+        velocity=orbit_velocity,
     )
 
     # 4. Compute Stereo
