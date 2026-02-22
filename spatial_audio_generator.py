@@ -100,7 +100,7 @@ if __name__ == "__main__":
     input_audio_path = r"mea.wav"
     output_audio_path = r"orbiting_sound.wav"
     orbit_distance = 3.0
-    num_rotations = 1.0
+    num_rotations = 0.5
 
     # Ensure output directory exists
     output_dir = os.path.dirname(output_audio_path)
