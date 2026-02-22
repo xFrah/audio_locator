@@ -267,7 +267,22 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
         M = first_val[2]
     else:
         M = len(first_val[0])
-    L = 512  # Window size for the input chunk
+    is_stationary = (abs(start_azi - end_azi) < 0.5) and (abs(start_dist - end_dist) < 0.1)
+
+    if is_stationary:
+        from scipy.signal import fftconvolve
+
+        h_l, h_r = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=hrir_cache, azimuth=start_azi, distance=start_dist)
+        spatial_L = fftconvolve(dry_data, h_l, mode="full").astype(np.float32)
+        spatial_R = fftconvolve(dry_data, h_r, mode="full").astype(np.float32)
+        stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
+
+        if normalize:
+            peak = np.max(np.abs(stereo_buffer))
+            if peak > 0:
+                stereo_buffer = stereo_buffer / peak * 0.9
+
+        return stereo_buffer
 
     out_length = n_samples + M - 1
     spatial_L = np.zeros(out_length, dtype=np.float32)
@@ -279,7 +294,7 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
 
     from scipy.signal import fftconvolve, get_window
 
-    window_size = 512
+    window_size = 2048
     hop = window_size // 2
     window = get_window("hann", window_size).astype(np.float32)
 

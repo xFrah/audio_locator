@@ -86,7 +86,7 @@ def _compute_hrir_worker(args):
     azi_deg, dist_m, room_size, listener_pos = args
     room = slab.Room(size=room_size, listener=listener_pos)
     room.set_source([float(azi_deg), 0, float(dist_m)])
-    hrir = room.hrir()
+    hrir = room.hrir(reverb=False)
     hrir_data = hrir.data  # (n_taps, 2)
     return float(azi_deg), round(dist_m, 2), hrir_data[:, 0].copy(), hrir_data[:, 1].copy()
 
@@ -288,7 +288,7 @@ def _spatialize_sound(args):
 
         def __getitem__(self, key):
             off_L, off_R, length = self.meta[key]
-            return self.array[off_L : off_L + length].copy(), self.array[off_R : off_R + length].copy()
+            return self.array[off_L : off_L + length], self.array[off_R : off_R + length]
 
         def values(self):
             for off_L, off_R, length in self.meta.values():

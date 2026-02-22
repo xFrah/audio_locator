@@ -34,7 +34,7 @@ def bce_loss(pred_logits, target):
     )
 
 
-def train(epochs=100, batch_size=24, lr=1e-6, azi_bins=180, epoch_duration_seconds=5000, device=None):
+def train(epochs=100, batch_size=24, lr=1e-5, azi_bins=180, epoch_duration_seconds=5000, device=None):
 
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
