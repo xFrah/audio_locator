@@ -46,7 +46,7 @@ if __name__ == "__main__":
         end_dist=orbit_distance,
         end_azi=360.0 * num_rotations,
         is_circular=True,
-        velocity=orbit_velocity,
+        speed=orbit_velocity,
     )
 
     # 4. Compute Stereo

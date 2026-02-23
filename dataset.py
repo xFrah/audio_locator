@@ -9,6 +9,7 @@ from multiprocessing import shared_memory
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 from scipy.signal import fftconvolve
+import HRTF_convolver
 
 from convert_wav import (
     DEFAULT_SAMPLE_RATE,
@@ -121,6 +122,8 @@ def precompute_hrir_grid(azi_step=0.5, dist_steps=None, max_distance=None, room_
     # Need to generate float sequence since range doesn't support floats
     azi_range = np.arange(0, 360, azi_step)
     already_cached = sum(1 for a in azi_range for d in dist_steps if (float(a), round(d, 2)) in local_cache)
+
+    assert already_cached == total, f"Missing {total - already_cached} HRIRs"
 
     if already_cached < total:
         print(f"Precomputing HRIR grid ({num_azi_steps} azimuths × {len(dist_steps)} distances = {total} positions)...")
@@ -262,16 +265,7 @@ def _spatialize_sound(args):
     """Worker: convolve mono sound with HRIR and add to shared memory buffer."""
     (
         idx,
-        wav_path,
-        start_azi,
-        start_dist,
-        end_azi,
-        end_dist,
-        is_circular,
-        velocity,
-        max_distance,
-        room_size,
-        listener_pos,
+        sound_obj,
         start_sample,
         shm_name,
         buf_shape,
@@ -279,10 +273,8 @@ def _spatialize_sound(args):
         hrir_shm_meta,
     ) = args
 
-    # Reseed to ensure different randomness if needed (though we pass explicit params here)
+    # Reseed to ensure different randomness if needed
     np.random.seed(seed)
-
-    dry_mono = wav_path  # args can contain the data directly
 
     # Initialize shared memory for HRIR if not already
     global _hrir_shm, _hrir_shm_array, _hrir_shm_meta
@@ -313,14 +305,7 @@ def _spatialize_sound(args):
 
     wrapper = HRIRDictWrapper(_hrir_shm_meta, _hrir_shm_array)
 
-    sr = DEFAULT_SAMPLE_RATE
-
-    # Create SpatialSound object
-    sound = HRTF_convolver.SpatialSound(
-        dry_mono=dry_mono, sr=sr, start_dist=start_dist, start_azi=start_azi, end_dist=end_dist, end_azi=end_azi, is_circular=is_circular, velocity=velocity
-    )
-
-    stereo_buffer = sound.compute_stereo(hrir_cache=wrapper, normalize=False)
+    stereo_buffer = sound_obj.compute_stereo(hrir_cache=wrapper, normalize=False)
     spatial_L = stereo_buffer[0]
     spatial_R = stereo_buffer[1]
 
@@ -354,8 +339,8 @@ def generate_epoch(
     # num_workers=14,
     num_workers=8,
     moving_prob=0.5,  # Probability that a sound moves
-    max_velocity=90.0,
-):  # Max velocity in degrees/second
+    max_speed=90.0,
+):  # Max speed in degrees/second
     """Generate a fresh random dataset in memory using cached HRIRs and audio.
 
     Returns:
@@ -435,79 +420,15 @@ def generate_epoch(
             # Retrieve data in main thread
             try:
                 dry_mono = _audio_cache[wav_path]
-                duration_sec = len(dry_mono) / sr
 
-                # Movement logic
-                # Movement logic: Vector-based
-                start_azi = random.uniform(0, 360)
-                # Distance distribution: Mostly 2-4m, few near 0.
-                # Triangular distribution peaking at 3.5m (assuming max~5)
-                start_dist = random.triangular(0.5, max_distance, 3.5)
+                # Movement logic and object creation
+                sound_obj = HRTF_convolver.SpatialSound.generate_random(dry_mono=dry_mono, sr=sr, max_distance=max_distance, moving_prob=moving_prob)
 
-                # Convert to Cartesian
-                sa_rad = np.radians(start_azi)
-                sx = start_dist * np.sin(sa_rad)
-                sy = start_dist * np.cos(sa_rad)
-
-                end_azi = start_azi
-                end_dist = start_dist
-
-                if random.random() < moving_prob and duration_sec > 0.5:
-                    is_circular = random.random() < 0.5
-                    speed = random.uniform(0.5, 3.0)  # m/s (Reasonable walking/running speed)
-
-                    if not is_circular:
-                        # Random velocity vector (Linear)
-                        move_heading = random.uniform(0, 360)
-
-                        # Velocity components
-                        mh_rad = np.radians(move_heading)
-                        vx = speed * np.sin(mh_rad)
-                        vy = speed * np.cos(mh_rad)
-
-                        # Unclamped end pos
-                        ex = sx + vx * duration_sec
-                        ey = sy + vy * duration_sec
-
-                        final_dist = np.sqrt(ex**2 + ey**2)
-                        if final_dist > max_distance:
-                            scale = max_distance / final_dist
-                            ex *= scale
-                            ey *= scale
-                            final_dist = max_distance
-
-                        # Convert end back to polar
-                        end_dist = final_dist
-                        end_azi = np.degrees(np.arctan2(ex, ey)) % 360
-                    else:
-                        # Circular motion
-                        # We pick a target end_azi to indicate rotation direction
-                        # The actual movement is governed by velocity in compute_stereo
-                        direction = random.choice([-1.0, 1.0])
-                        # Just a hint for rotation direction in compute_stereo
-                        end_azi = start_azi + direction * 10
-                        end_dist = start_dist  # Keep constant distance for circular
-                else:
-                    # Static
-                    is_circular = False
-                    speed = None
-                    end_azi = start_azi
-                    end_dist = start_dist
-
-                # Pack job (removed hrir_L/R from args, worker looks them up)
+                # Pack job
                 spat_jobs.append(
                     (
                         i,
-                        dry_mono,
-                        start_azi,
-                        start_dist,
-                        end_azi,
-                        end_dist,
-                        is_circular,
-                        speed,
-                        max_distance,
-                        room_size,
-                        listener_pos,
+                        sound_obj,
                         start_sample,
                         _shm.name,
                         buf_shape,
@@ -517,17 +438,11 @@ def generate_epoch(
                 )
 
                 # Store event metadata
-                # For moving sounds, we need start/end azi to interpolate labels
                 events.append(
                     {
-                        "start_sample": start_sample,
                         "idx": i,
-                        "start_azi": start_azi,
-                        "end_azi": end_azi,
-                        "start_dist": start_dist,
-                        "end_dist": end_dist,
-                        "is_circular": is_circular,
-                        "speed": speed,
+                        "start_sample": start_sample,
+                        "sound_obj": sound_obj,
                     }
                 )
             except Exception:
@@ -692,19 +607,9 @@ def generate_epoch(
                     radius = r_max - progress_f * (r_max - r_min)
 
                     # Calculate Azimuth and Distance at win_end using the unified trajectory logic
+                    sound_obj = ev["sound_obj"]
                     progress = (win_end - ev["start_sample"]) / (ev["end_sample"] - ev["start_sample"])
-                    duration_sec = (ev["end_sample"] - ev["start_sample"]) / sr
-
-                    current_azi, current_dist = HRTF_convolver.get_spatial_pos(
-                        progress=progress,
-                        duration_sec=duration_sec,
-                        start_azi=ev["start_azi"],
-                        start_dist=ev["start_dist"],
-                        end_azi=ev["end_azi"],
-                        end_dist=ev["end_dist"],
-                        is_circular=ev["is_circular"],
-                        velocity=ev["speed"],
-                    )
+                    current_azi, current_dist = sound_obj.get_pos(progress)
 
                     # Compute angular width based on distance and radius from listener perspective
                     if current_dist <= radius:
@@ -732,20 +637,20 @@ def generate_epoch(
                         labels[win_idx, idx] = max(labels[win_idx, idx], val)
 
                     # Store metadata for visualization
-                    # We want to know: ID, Trajectory (Start->End), Current Pos, Timing, Radius, Width
                     metadata_list[win_idx].append(
                         {
                             "id": ev["idx"],
                             "start_sample": ev["start_sample"],
                             "end_sample": ev["end_sample"],
-                            "traj_start": (ev["start_azi"], ev["start_dist"]),
-                            "traj_end": (ev["end_azi"], ev["end_dist"]),
+                            "traj_start": (sound_obj.start_azi, sound_obj.start_dist),
+                            "traj_end": (sound_obj.end_azi, sound_obj.end_dist),
                             "current_pos": (current_azi, current_dist),
                             "win_range": (win_start, win_end),
                             "radius": radius,
                             "width_deg": width_deg,
-                            "is_circular": ev["is_circular"],
-                            "speed": ev["speed"],
+                            "is_circular": sound_obj.is_circular,
+                            "speed": sound_obj.speed,
+                            "is_stationary": sound_obj.is_stationary,
                         }
                     )
 

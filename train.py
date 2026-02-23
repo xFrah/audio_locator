@@ -34,7 +34,8 @@ def bce_loss(pred_logits, target):
     )
 
 
-def train(epochs=100, batch_size=24, lr=1e-6, azi_bins=180, epoch_duration_seconds=5000, device=None):
+def train(epochs=100, batch_size=24, lr=1e-5
+, azi_bins=180, epoch_duration_seconds=5000, device=None):
 
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -70,6 +71,16 @@ def train(epochs=100, batch_size=24, lr=1e-6, azi_bins=180, epoch_duration_secon
     best_loss = float("inf")
 
     for epoch in tqdm(range(epochs), desc="Epochs"):
+        # Explicit cleanup of previous data before generating next
+        if "train_chunks_spatial" in locals():
+            del train_chunks_spatial
+        if "train_chunks_gcc" in locals():
+            del train_chunks_gcc
+        if "train_labels" in locals():
+            del train_labels
+        if "train_metadata" in locals():
+            del train_metadata
+        gc.collect()
 
         # Generate this epoch's data
         tqdm.write(f"\nGenerating epoch {epoch+1} data ({epoch_duration_seconds}s, {num_sounds} sounds)…")

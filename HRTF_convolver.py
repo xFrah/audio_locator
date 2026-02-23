@@ -250,71 +250,7 @@ def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=No
     return hrir_L, hrir_R
 
 
-def get_spatial_pos(
-    progress,
-    duration_sec,
-    start_azi,
-    start_dist,
-    end_azi,
-    end_dist,
-    is_circular=False,
-    velocity=None,
-):
-    """Calculates the (azimuth, distance) at a given progress [0, 1]."""
-    global DISTANCE_STEPS
-
-    progress = np.clip(progress, 0.0, 1.0)
-    t = progress * duration_sec
-
-    # Convert start/end to Cartesian for linear interpolation
-    sa_rad = np.radians(start_azi)
-    ea_rad = np.radians(end_azi)
-    sx, sy = start_dist * np.sin(sa_rad), start_dist * np.cos(sa_rad)
-    ex, ey = end_dist * np.sin(ea_rad), end_dist * np.cos(ea_rad)
-
-    if velocity is not None:
-        dist_moved = velocity * t
-        if not is_circular:
-            # Move along the vector from start to end
-            dx, dy = ex - sx, ey - sy
-            total_path_dist = np.sqrt(dx**2 + dy**2)
-            if total_path_dist > 1e-6:
-                cur_x = sx + (dx / total_path_dist) * dist_moved
-                cur_y = sy + (dy / total_path_dist) * dist_moved
-            else:
-                cur_x, cur_y = sx, sy
-
-            dist = np.sqrt(cur_x**2 + cur_y**2)
-            azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
-        else:
-            # Move along the arc
-            dist = start_dist + (end_dist - start_dist) * progress
-            angle_diff = end_azi - start_azi
-            if abs(angle_diff) < 1e-6:
-                azi = start_azi
-            else:
-                direction = 1.0 if angle_diff > 0 else -1.0
-                angular_delta_rad = dist_moved / max(dist, 0.1)
-                azi = start_azi + direction * np.degrees(angular_delta_rad)
-                azi = azi % 360
-    else:
-        # Traditional linear interpolation of progress
-        if not is_circular:
-            cur_x = sx + (ex - sx) * progress
-            cur_y = sy + (ey - sy) * progress
-            dist = np.sqrt(cur_x**2 + cur_y**2)
-            azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
-        else:
-            # Linear interpolation in polar coordinates
-            azi = start_azi + (end_azi - start_azi) * progress
-            dist = start_dist + (end_dist - start_dist) * progress
-            azi = azi % 360
-
-    dist = np.clip(dist, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
-    return azi, dist
-
-
-def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist, hrir_cache=None, normalize=True, is_circular=False, velocity=None):
+def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist, hrir_cache=None, normalize=True, is_circular=False, speed=None):
     import random
     from convert_wav import DEFAULT_SAMPLE_RATE
 
@@ -367,22 +303,56 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
     sa_rad = np.radians(start_azi)
     ea_rad = np.radians(end_azi)
 
-    sx, sy = start_dist * np.sin(sa_rad), start_dist * np.cos(sa_rad)
-    ex, ey = end_dist * np.sin(ea_rad), end_dist * np.cos(ea_rad)
+    # Create a dummy SpatialSound object for trajectory calculations
+    trajectory = SpatialSound(
+        dry_mono=dry_data,
+        sr=sr,
+        start_dist=start_dist,
+        start_azi=start_azi,
+        end_dist=end_dist,
+        end_azi=end_azi,
+        is_circular=is_circular,
+        speed=speed,
+    )
 
-    duration_sec = n_samples / sr
+    for b_start in range(0, n_samples - window_size + 1, hop):
+        b_end = b_start + window_size
+        x_r = dry_data[b_start:b_end] * window
+        x_r_lp = dry_data_lp[b_start:b_end] * window
 
-    def get_pos(progress):
-        return get_spatial_pos(
-            progress,
-            duration_sec,
-            start_azi,
-            start_dist,
-            end_azi,
-            end_dist,
-            is_circular=is_circular,
-            velocity=velocity,
-        )
+        progress = (b_start + hop) / n_samples
+        azi1, dist1 = trajectory.get_pos(progress)
+
+        h_l_next, h_r_next = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=hrir_cache, azimuth=azi1, distance=dist1)
+
+        conv_L_cross = fftconvolve(x_r, h_l_next, mode="full")
+        conv_R_cross = fftconvolve(x_r, h_r_next, mode="full")
+
+        # Align low frequencies to the peak of the direct path of the HRIR
+        peak_idx = np.argmax(np.abs(h_l_next))
+        lp_start = b_start + peak_idx
+
+        if lp_start < out_length:
+            write_len_lp = min(len(x_r_lp), out_length - lp_start)
+            spatial_L[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
+            spatial_R[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
+
+        l_conv = len(conv_L_cross)
+        target_end = min(b_start + l_conv, out_length)
+        write_len_hp = target_end - b_start
+
+        if write_len_hp > 0:
+            spatial_L[b_start:target_end] += conv_L_cross[:write_len_hp]
+            spatial_R[b_start:target_end] += conv_R_cross[:write_len_hp]
+
+    stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
+
+    if normalize:
+        peak = np.max(np.abs(stereo_buffer))
+        if peak > 0:
+            stereo_buffer = stereo_buffer / peak * 0.9
+
+    return stereo_buffer
 
     for b_start in range(0, n_samples - window_size + 1, hop):
         b_end = b_start + window_size
@@ -427,7 +397,7 @@ def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist
 class SpatialSound:
     """Encapsulates a mono sound with spatial trajectory properties."""
 
-    def __init__(self, dry_mono, sr, start_dist, start_azi, end_dist, end_azi, is_circular=False, velocity=None):
+    def __init__(self, dry_mono, sr, start_dist, start_azi, end_dist, end_azi, is_circular=False, speed=None):
         self.dry_mono = dry_mono
         self.sr = sr
         self.start_dist = start_dist
@@ -435,7 +405,73 @@ class SpatialSound:
         self.end_dist = end_dist
         self.end_azi = end_azi
         self.is_circular = is_circular
-        self.velocity = velocity
+        self.speed = speed
+        self.is_stationary = (abs(start_azi - end_azi) < 0.5) and (abs(start_dist - end_dist) < 0.1)
+
+    @staticmethod
+    def generate_random(dry_mono, sr, max_distance, moving_prob=0.5):
+        """Factory method to create a SpatialSound with a random trajectory."""
+        import random
+
+        duration_sec = len(dry_mono) / sr
+        start_azi = random.uniform(0, 360)
+        # Distance distribution: Mostly 2-4m, few near 0.
+        # Triangular distribution peaking at 3.5m (assuming max~5)
+        start_dist = random.triangular(0.5, max_distance, 3.5)
+
+        # Convert to Cartesian for vector math
+        sa_rad = np.radians(start_azi)
+        sx = start_dist * np.sin(sa_rad)
+        sy = start_dist * np.cos(sa_rad)
+
+        if random.random() < moving_prob and duration_sec > 0.5:
+            is_circular = random.random() < 0.5
+            speed = random.uniform(0.5, 3.0)  # m/s (Reasonable walking/running speed)
+
+            if not is_circular:
+                # Random velocity vector (Linear)
+                move_heading = random.uniform(0, 360)
+                mh_rad = np.radians(move_heading)
+                vx = speed * np.sin(mh_rad)
+                vy = speed * np.cos(mh_rad)
+
+                # Unclamped end pos
+                ex = sx + vx * duration_sec
+                ey = sy + vy * duration_sec
+
+                final_dist = np.sqrt(ex**2 + ey**2)
+                if final_dist > max_distance:
+                    scale = max_distance / final_dist
+                    ex *= scale
+                    ey *= scale
+                    final_dist = max_distance
+
+                # Convert end back to polar
+                end_dist = final_dist
+                end_azi = np.degrees(np.arctan2(ex, ey)) % 360
+            else:
+                # Circular motion
+                direction = random.choice([-1.0, 1.0])
+                # Just a hint for rotation direction
+                end_azi = start_azi + direction * 10
+                end_dist = start_dist  # Keep constant distance for circular
+        else:
+            # Static
+            is_circular = False
+            speed = None
+            end_azi = start_azi
+            end_dist = start_dist
+
+        return SpatialSound(
+            dry_mono=dry_mono,
+            sr=sr,
+            start_dist=start_dist,
+            start_azi=start_azi,
+            end_dist=end_dist,
+            end_azi=end_azi,
+            is_circular=is_circular,
+            speed=speed,
+        )
 
     def compute_stereo(self, hrir_cache=None, normalize=True):
         """Computes the stereo audio based on the trajectory."""
@@ -449,22 +485,63 @@ class SpatialSound:
             hrir_cache=hrir_cache,
             normalize=normalize,
             is_circular=self.is_circular,
-            velocity=self.velocity,
+            speed=self.speed,
         )
 
     def get_pos(self, progress):
         """Calculates the (azimuth, distance) at a given progress [0, 1]."""
+        global DISTANCE_STEPS
+
+        progress = np.clip(progress, 0.0, 1.0)
         duration_sec = len(self.dry_mono) / self.sr
-        return get_spatial_pos(
-            progress,
-            duration_sec,
-            self.start_azi,
-            self.start_dist,
-            self.end_azi,
-            self.end_dist,
-            is_circular=self.is_circular,
-            velocity=self.velocity,
-        )
+        t = progress * duration_sec
+
+        # Convert start/end to Cartesian for linear interpolation
+        sa_rad = np.radians(self.start_azi)
+        ea_rad = np.radians(self.end_azi)
+        sx, sy = self.start_dist * np.sin(sa_rad), self.start_dist * np.cos(sa_rad)
+        ex, ey = self.end_dist * np.sin(ea_rad), self.end_dist * np.cos(ea_rad)
+
+        if self.speed is not None:
+            dist_moved = self.speed * t
+            if not self.is_circular:
+                # Move along the vector from start to end
+                dx, dy = ex - sx, ey - sy
+                total_path_dist = np.sqrt(dx**2 + dy**2)
+                if total_path_dist > 1e-6:
+                    cur_x = sx + (dx / total_path_dist) * dist_moved
+                    cur_y = sy + (dy / total_path_dist) * dist_moved
+                else:
+                    cur_x, cur_y = sx, sy
+
+                dist = np.sqrt(cur_x**2 + cur_y**2)
+                azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
+            else:
+                # Move along the arc
+                dist = self.start_dist + (self.end_dist - self.start_dist) * progress
+                angle_diff = self.end_azi - self.start_azi
+                if abs(angle_diff) < 1e-6:
+                    azi = self.start_azi
+                else:
+                    direction = 1.0 if angle_diff > 0 else -1.0
+                    angular_delta_rad = dist_moved / max(dist, 0.1)
+                    azi = self.start_azi + direction * np.degrees(angular_delta_rad)
+                    azi = azi % 360
+        else:
+            # Traditional linear interpolation of progress
+            if not self.is_circular:
+                cur_x = sx + (ex - sx) * progress
+                cur_y = sy + (ey - sy) * progress
+                dist = np.sqrt(cur_x**2 + cur_y**2)
+                azi = np.degrees(np.arctan2(cur_x, cur_y)) % 360
+            else:
+                # Linear interpolation in polar coordinates
+                azi = self.start_azi + (self.end_azi - self.start_azi) * progress
+                dist = self.start_dist + (self.end_dist - self.start_dist) * progress
+                azi = azi % 360
+
+        dist = np.clip(dist, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
+        return azi, dist
 
 
 if __name__ == "__main__":
