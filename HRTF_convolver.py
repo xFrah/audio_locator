@@ -429,7 +429,7 @@ class SpatialSound:
 
 if __name__ == "__main__":
     import soundfile as sf
-    from convert_wav import DEFAULT_SAMPLE_RATE
+    from config import DEFAULT_SAMPLE_RATE
 
     sr = DEFAULT_SAMPLE_RATE
 

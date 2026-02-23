@@ -1,0 +1,15 @@
+# --- Shared Audio Constants ---
+DEFAULT_SAMPLE_RATE = 44100
+DEFAULT_N_FFT = 2048
+DEFAULT_HOP_LENGTH = 512
+DEFAULT_WINDOW_SIZE_SECONDS = 2.0
+DEFAULT_GCC_MAX_TAU = 64  # Number of lag bins to keep from GCC-PHAT
+
+# Derived constants
+DEFAULT_FREQ_BINS = DEFAULT_N_FFT // 2 + 1  # 1025
+NUM_SPATIAL_CHANNELS = 4  # stft_mag_L, stft_mag_R, ILD, IPD
+NUM_GCC_CHANNELS = 1  # GCC-PHAT
+
+MODELS_FOLDER = "models"
+OUTPUT_FOLDER = "output"
+SOUNDS_FOLDER = "sounds"

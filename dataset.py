@@ -12,17 +12,8 @@ from scipy.signal import fftconvolve
 import HRTF_convolver
 from hrir_cache import cache
 
-from convert_wav import (
-    DEFAULT_SAMPLE_RATE,
-    DEFAULT_N_FFT,
-    DEFAULT_HOP_LENGTH,
-    DEFAULT_WINDOW_SIZE_SECONDS,
-    DEFAULT_GCC_MAX_TAU,
-    DEFAULT_FREQ_BINS,
-    NUM_SPATIAL_CHANNELS,
-    NUM_GCC_CHANNELS,
-    compute_spatial_features,
-)
+import torch
+from config import *
 
 # Initialize persistent pool globally using all available cores minus one
 _persistent_pool = ProcessPoolExecutor(max_workers=max(1, os.cpu_count() - 1))
@@ -33,6 +24,96 @@ RMS_WINDOW_DURATION = 0.05  # 50ms for instantaneous intensity
 
 # Match slab's HRIR samplerate to our audio pipeline
 slab.set_default_samplerate(DEFAULT_SAMPLE_RATE)
+
+
+def compute_t_frames(window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS, sr=DEFAULT_SAMPLE_RATE, hop_length=DEFAULT_HOP_LENGTH):
+    """Compute the number of time frames T for a given window size."""
+    total_samples = int(window_size_seconds * sr)
+    return total_samples // hop_length + 1
+
+
+def compute_spatial_features(
+    y_left, y_right, sr=DEFAULT_SAMPLE_RATE, n_fft=DEFAULT_N_FFT, hop_length=DEFAULT_HOP_LENGTH, n_gcc_bins=DEFAULT_GCC_MAX_TAU
+):
+    """Compute all spatial audio features from a stereo pair.
+
+    Returns:
+        spatial_features: np.ndarray of shape (4, F_max, T)
+            0 — STFT magnitude L (dB)
+            1 — STFT magnitude R (dB)
+            2 — ILD (mag_L_dB - mag_R_dB), full STFT resolution
+            3 — IPD (interaural phase difference)
+        gcc_features: np.ndarray of shape (1, n_gcc_bins, T)
+            0 — GCC-PHAT
+    """
+    F_max = n_fft // 2 + 1  # 1025
+
+    # --- STFT (complex) ---
+    stft_L = librosa.stft(y_left, n_fft=n_fft, hop_length=hop_length)  # (F_max, T)
+    stft_R = librosa.stft(y_right, n_fft=n_fft, hop_length=hop_length)  # (F_max, T)
+
+    T = stft_L.shape[1]
+
+    # STFT magnitude in dB (F_max, T) - Use global max reference
+    global_max = np.max(np.maximum(np.abs(stft_L), np.abs(stft_R)))
+    mag_L = librosa.amplitude_to_db(np.abs(stft_L), ref=global_max)
+    mag_R = librosa.amplitude_to_db(np.abs(stft_R), ref=global_max)
+
+    # --- ILD at full STFT resolution (F_max, T) ---
+    ild = mag_L - mag_R
+
+    # --- IPD (F_max, T) ---
+    ipd = np.angle(stft_L * np.conj(stft_R))
+
+    # --- GCC-PHAT (n_gcc_bins, T) ---
+    cross_spec = stft_L * np.conj(stft_R)
+    denom = np.abs(cross_spec) + 1e-8
+    gcc_full = np.fft.irfft(cross_spec / denom, n=n_fft, axis=0)  # (n_fft, T)
+    # Keep only the relevant lags around zero: [-n_gcc_bins//2 .. n_gcc_bins//2-1]
+    half = n_gcc_bins // 2
+    gcc = np.concatenate([gcc_full[-half:, :], gcc_full[:half, :]], axis=0)  # (n_gcc_bins, T)
+
+    spatial_features = np.stack(
+        [
+            mag_L,  # 0: STFT mag L
+            mag_R,  # 1: STFT mag R
+            ild,  # 2: ILD (full resolution)
+            ipd,  # 3: IPD
+        ],
+        axis=0,
+    ).astype(
+        np.float32
+    )  # (4, F_max, T)
+
+    gcc_features = np.expand_dims(gcc.astype(np.float32), axis=0)  # (1, n_gcc_bins, T)
+
+    return spatial_features, gcc_features
+
+
+def prepare_audio_input_librosa(
+    file_path, window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS, sr=DEFAULT_SAMPLE_RATE, n_fft=DEFAULT_N_FFT, hop_length=DEFAULT_HOP_LENGTH
+):
+    # 1. Load audio (mono=False keeps it stereo)
+    y, _ = librosa.load(file_path, sr=sr, mono=False)
+
+    assert y.shape[0] == 2, "Audio file must have exactly 2 channels."
+
+    # 2. Trim or pad to exactly window_size_seconds
+    target_samples = int(window_size_seconds * sr)
+    if y.shape[1] > target_samples:
+        y = y[:, :target_samples]
+    elif y.shape[1] < target_samples:
+        pad_width = target_samples - y.shape[1]
+        y = np.pad(y, ((0, 0), (0, pad_width)), mode="constant")
+
+    # 3. Compute spatial features
+    spatial_features, gcc_features = compute_spatial_features(y[0], y[1], sr=sr, n_fft=n_fft, hop_length=hop_length)
+
+    # 4. Convert to Torch Tensor with batch dimension
+    spatial_tensor = torch.from_numpy(spatial_features).unsqueeze(0)  # (1, 4, F_max, T)
+    gcc_tensor = torch.from_numpy(gcc_features).unsqueeze(0)  # (1, 1, n_gcc_bins, T)
+
+    return spatial_tensor, gcc_tensor
 
 
 # ============================================================
@@ -46,25 +127,25 @@ _audio_cache = {}  # wav_path -> np.ndarray (samples,)  mono at target sr
 # (Uses global cache from hrir_cache)
 
 
-def _get_wav_paths(sounds_dir):
+def _get_wav_paths():
     """Get list of wav file paths (cached)."""
-    if sounds_dir not in _wav_paths_cache:
-        wav_files = glob.glob(os.path.join(sounds_dir, "**", "*.wav"), recursive=True)
-        assert len(wav_files) > 0, f"No .wav files found in {sounds_dir}"
-        _wav_paths_cache[sounds_dir] = wav_files
-    return _wav_paths_cache[sounds_dir]
+    if SOUNDS_FOLDER not in _wav_paths_cache:
+        wav_files = glob.glob(os.path.join(SOUNDS_FOLDER, "**", "*.wav"), recursive=True)
+        assert len(wav_files) > 0, f"No .wav files found in {SOUNDS_FOLDER}"
+        _wav_paths_cache[SOUNDS_FOLDER] = wav_files
+    return _wav_paths_cache[SOUNDS_FOLDER]
 
 
-def preload_audio(sounds_dir, sr=DEFAULT_SAMPLE_RATE):
+def preload_audio():
     """Load all wav files into memory as mono numpy arrays at target sr."""
-    wav_files = _get_wav_paths(sounds_dir)
+    wav_files = _get_wav_paths()
     loaded = 0
     for path in tqdm(wav_files, desc="Loading audio files", leave=False):
         if path not in _audio_cache:
             try:
                 sound = slab.Sound.read(path)
-                if sound.samplerate != sr:
-                    sound = sound.resample(sr)
+                if sound.samplerate != DEFAULT_SAMPLE_RATE:
+                    sound = sound.resample(DEFAULT_SAMPLE_RATE)
                 # Store as mono (just channel 0, or mean if stereo)
                 data = sound.data
                 if data.ndim > 1:
@@ -127,7 +208,7 @@ def _spatialize_sound(args):
         cache.initialize(use_shared_memory=True, quiet=True)
 
     import HRTF_convolver
-    from convert_wav import DEFAULT_SAMPLE_RATE
+    from config import DEFAULT_SAMPLE_RATE
 
     stereo_buffer = sound_obj.compute_stereo(normalize=False)
     spatial_L = stereo_buffer[0]
@@ -159,7 +240,6 @@ def generate_epoch(
     room_size=[10.0, 10.0, 3.0],
     listener_pos=[5.0, 5.0, 1.5],
     sigma_deg=13.0,
-    sounds_dir=r"sounds\sounds",
     # num_workers=14,
     num_workers=8,
     moving_prob=0.5,  # Probability that a sound moves
@@ -186,11 +266,18 @@ def generate_epoch(
 
     # --- One-time initialization ---
     if not _initialized:
-        preload_audio(sounds_dir, sr=sr)
+        preload_audio()
 
-        cache.initialize(pool=_persistent_pool, use_shared_memory=True, max_distance=max_distance, room_size=room_size, listener_pos=listener_pos, quiet=False)
+        cache.initialize(
+            pool=_persistent_pool,
+            use_shared_memory=True,
+            max_distance=max_distance,
+            room_size=room_size,
+            listener_pos=listener_pos,
+            quiet=False,
+        )
 
-        wav_files = _get_wav_paths(sounds_dir)
+        wav_files = _get_wav_paths()
         _filtered_wav_files = [f for f in wav_files if f in _audio_cache]
 
         # Precompute T (number of STFT time frames)
@@ -247,7 +334,13 @@ def generate_epoch(
                 dry_mono = _audio_cache[wav_path]
 
                 # Movement logic and object creation
-                sound_obj = HRTF_convolver.SpatialSound.generate_random(dry_mono=dry_mono, sr=sr, max_distance=max_distance, moving_prob=moving_prob, max_speed=max_speed)
+                sound_obj = HRTF_convolver.SpatialSound.generate_random(
+                    dry_mono=dry_mono,
+                    sr=sr,
+                    max_distance=max_distance,
+                    moving_prob=moving_prob,
+                    max_speed=max_speed,
+                )
 
                 # Pack job
                 spat_jobs.append(
@@ -490,7 +583,7 @@ def generate_epoch(
 # --- CLI: quick test ---
 if __name__ == "__main__":
     import soundfile as sf
-    from convert_wav import DEFAULT_SAMPLE_RATE
+    from config import DEFAULT_SAMPLE_RATE
 
     chunks_spatial, chunks_gcc, labels, meta, stereo_buffer = generate_epoch(
         total_duration_seconds=60,

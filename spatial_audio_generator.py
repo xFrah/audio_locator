@@ -3,12 +3,12 @@ import numpy as np
 import soundfile as sf
 
 from HRTF_convolver import load_and_resample, SpatialSound
-from convert_wav import DEFAULT_SAMPLE_RATE
+from config import DEFAULT_SAMPLE_RATE, SOUNDS_FOLDER, OUTPUT_FOLDER
 
 
 if __name__ == "__main__":
-    input_audio_path = r"mea.wav"
-    output_audio_path = r"orbiting_sound.wav"
+    input_audio_path = os.path.join(SOUNDS_FOLDER, "mea.wav")
+    output_audio_path = os.path.join(OUTPUT_FOLDER, "orbiting_sound.wav")
     orbit_distance = 3.0
     num_rotations = 3.0
 

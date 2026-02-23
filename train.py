@@ -1,23 +1,16 @@
 import torch
 import warnings
 import os
-import threading
-import time
 import gc
 
 # Suppress "PyTorch is not compiled with NCCL support" warning on Windows
 warnings.filterwarnings("ignore", message=".*PyTorch is not compiled with NCCL support.*")
 import torch.nn.functional as F
-import numpy as np
-import matplotlib
 
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-import random
 from tqdm import tqdm
 
-from main import SpatialAudioHeatmapLocator
-from convert_wav import NUM_SPATIAL_CHANNELS, NUM_GCC_CHANNELS
+from model import SpatialAudioHeatmapLocator
+from config import NUM_SPATIAL_CHANNELS, NUM_GCC_CHANNELS, OUTPUT_FOLDER, MODELS_FOLDER
 from dataset import generate_epoch
 from plot import LiveComparisonPlot
 
@@ -41,12 +34,18 @@ def train(epochs=100, batch_size=24, lr=1e-6, azi_bins=180, epoch_duration_secon
     print(f"Device: {device}")
 
     # --- Model, optimizer ---
-    model = SpatialAudioHeatmapLocator(input_channels=NUM_SPATIAL_CHANNELS, gcc_channels=NUM_GCC_CHANNELS, azi_bins=azi_bins).to(device)
+    model = SpatialAudioHeatmapLocator(
+        input_channels=NUM_SPATIAL_CHANNELS,
+        gcc_channels=NUM_GCC_CHANNELS,
+        azi_bins=azi_bins,
+    ).to(device)
 
-    if os.path.exists("resume.pt"):
+    resume_path = os.path.join(MODELS_FOLDER, "resume.pt")
+
+    if os.path.exists(resume_path):
         print("Found resume.pt, attempting to resume training from these weights...")
         try:
-            state_dict = torch.load("resume.pt", map_location=device, weights_only=True)
+            state_dict = torch.load(resume_path, map_location=device, weights_only=True)
             model.load_state_dict(state_dict)
             print("Successfully loaded resume.pt")
         except RuntimeError as e:
@@ -64,7 +63,13 @@ def train(epochs=100, batch_size=24, lr=1e-6, azi_bins=180, epoch_duration_secon
 
     # --- Data generation config ---
     num_sounds = int(epoch_duration_seconds * 1)
-    gen_kwargs = dict(total_duration_seconds=epoch_duration_seconds, num_sounds=num_sounds, update_interval_ms=2000, max_speed=5.0, moving_prob=0.8)
+    gen_kwargs = dict(
+        total_duration_seconds=epoch_duration_seconds,
+        num_sounds=num_sounds,
+        update_interval_ms=2000,
+        max_speed=5.0,
+        moving_prob=0.8,
+    )
 
     # --- Training loop ---
     best_loss = float("inf")
@@ -134,7 +139,7 @@ def train(epochs=100, batch_size=24, lr=1e-6, azi_bins=180, epoch_duration_secon
         # Save if best
         if avg_train < best_loss:
             best_loss = avg_train
-            save_path = "model.pt"
+            save_path = os.path.join(MODELS_FOLDER, "model.pt")
             state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
             torch.save(state_dict, save_path)
             tqdm.write(f"New best loss! Saved model to {save_path}")

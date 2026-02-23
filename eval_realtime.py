@@ -5,17 +5,9 @@ import librosa
 import numpy as np
 import torch
 
-from main import SpatialAudioHeatmapLocator
-from convert_wav import (
-    DEFAULT_SAMPLE_RATE,
-    DEFAULT_N_FFT,
-    DEFAULT_HOP_LENGTH,
-    DEFAULT_WINDOW_SIZE_SECONDS,
-    DEFAULT_GCC_MAX_TAU,
-    NUM_SPATIAL_CHANNELS,
-    NUM_GCC_CHANNELS,
-    compute_spatial_features,
-)
+from model import SpatialAudioHeatmapLocator
+from config import *
+from dataset import compute_spatial_features
 from plot import LivePredictionPlot
 
 
@@ -32,7 +24,11 @@ def evaluate_realtime(
     print(f"Using device: {device}")
 
     # --- Load Model ---
-    model = SpatialAudioHeatmapLocator(input_channels=NUM_SPATIAL_CHANNELS, gcc_channels=NUM_GCC_CHANNELS, azi_bins=180).to(device)
+    model = SpatialAudioHeatmapLocator(
+        input_channels=NUM_SPATIAL_CHANNELS,
+        gcc_channels=NUM_GCC_CHANNELS,
+        azi_bins=180,
+    ).to(device)
 
     if os.path.exists(model_path):
         print(f"Loading weights from {model_path}...")
@@ -165,8 +161,8 @@ def evaluate_realtime(
 
 if __name__ == "__main__":
     evaluate_realtime(
-        audio_path="orbiting_sound.wav",
-        model_path="model.pt",
+        audio_path=os.path.join(OUTPUT_FOLDER, "orbiting_sound.wav"),
+        model_path=os.path.join(MODELS_FOLDER, "model.pt"),
         window_duration=2.0,
         hop_duration=0.1,
         device="cuda:0",
