@@ -162,7 +162,7 @@ def evaluate_realtime(
 if __name__ == "__main__":
     evaluate_realtime(
         audio_path=os.path.join(OUTPUT_FOLDER, "orbiting_sound.wav"),
-        model_path=os.path.join(MODELS_FOLDER, "model.pt"),
+        model_path=os.path.join(MODELS_FOLDER, "best.pt"),
         window_duration=2.0,
         hop_duration=0.1,
         device="cuda:0",

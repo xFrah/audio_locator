@@ -240,46 +240,52 @@ class LivePredictionPlot:
 
         plt.ion()
         fig = plt.figure(figsize=(8, 8))
-        fig.suptitle("Waiting for first audio chunk…", fontsize=15)
-
         ax_pred = fig.add_subplot(1, 1, 1, projection="polar")
-        bars = None
+        mesh = None
+        title_text = fig.suptitle("Waiting for first audio chunk…", fontsize=15)
 
         fig.canvas.draw()
         plt.pause(0.01)
 
         while True:
             try:
-                data = q.get(timeout=0.05)
+                data = q.get(timeout=0.02)  # Faster polling
                 if data is None:
                     break
                 pred_logits, current_time_sec = data
 
                 pred_prob = 1.0 / (1.0 + np.exp(-pred_logits))
 
-                if bars is None:
+                if mesh is None:
                     azi_bins = pred_prob.shape[0]
-                    azimuths = np.linspace(0, 2 * np.pi, azi_bins, endpoint=False)
-                    width = 2 * np.pi / azi_bins
+                    # Create theta and r grids for pcolormesh
+                    # theta includes the endpoint to close the circle
+                    theta = np.linspace(0, 2 * np.pi, azi_bins + 1)
+                    r = np.array([0.0, 1.0])  # Fill the center
 
-                    colors = plt.cm.magma(pred_prob)
-                    bars = ax_pred.bar(azimuths, np.ones_like(pred_prob), width=width, bottom=0.0, color=colors, alpha=0.9)
+                    # Initial data for the mesh (must be 2D)
+                    mesh_data = pred_prob.reshape(1, -1)
+
+                    mesh = ax_pred.pcolormesh(theta, r, mesh_data, cmap="magma", shading="flat", vmin=0, vmax=1)
+
                     ax_pred.set_ylim(0, 1)
                     ax_pred.set_theta_zero_location("N")
                     ax_pred.set_theta_direction(-1)
                     ax_pred.set_title("Predicted Location", fontsize=15, pad=20)
+                    # Cleanup axis
+                    ax_pred.set_rticks([])
+                    ax_pred.grid(True, alpha=0.2)
 
                     # Add colorbar
-                    sm = plt.cm.ScalarMappable(cmap=plt.cm.magma, norm=plt.Normalize(vmin=0.0, vmax=1.0))
-                    sm.set_array([])
-                    cbar = fig.colorbar(sm, ax=ax_pred, orientation="vertical", fraction=0.046, pad=0.1)
-                    cbar.set_label("Prediction Probability", rotation=270, labelpad=15)
-                else:
-                    colors = plt.cm.magma(pred_prob)
-                    for bar, color in zip(bars, colors):
-                        bar.set_facecolor(color)
+                    cbar = fig.colorbar(mesh, ax=ax_pred, orientation="vertical", fraction=0.046, pad=0.1)
+                    cbar.set_label("Probability", rotation=270, labelpad=15)
 
-                fig.suptitle(f"Time: {current_time_sec:.1f}s", fontsize=15)
+                    fig.canvas.draw()
+                else:
+                    # Update mesh data directly - ultra fast
+                    mesh.set_array(pred_prob.flatten())
+
+                title_text.set_text(f"Time: {current_time_sec:.1f}s")
                 fig.canvas.draw_idle()
                 fig.canvas.flush_events()
             except queue.Empty:
