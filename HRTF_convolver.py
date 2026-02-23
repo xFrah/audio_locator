@@ -11,21 +11,16 @@ are other sound samples in the folder resources/sound.
 """
 
 import os
-import wave
 import itertools
 from hrir_cache import cache
-import pickle
 
 import scipy.io
-from scipy.io import wavfile
 import scipy.spatial
-import pyaudio
 import scipy.signal
 import librosa
-from tqdm import tqdm
 
 import numpy as np
-import numpy.linalg
+from config import *
 
 # Values of azimuth and distance used for HRIR interpolation.
 AZIMUTH_ANGLES = np.arange(0, 360.5, 0.5)
@@ -49,11 +44,9 @@ _polar_points = list(itertools.product(AZIMUTH_ANGLES, DISTANCE_STEPS))
 POINTS = np.array([polar_to_cartesian(a, d) for a, d in _polar_points])
 _POINTS_POLAR = np.array(_polar_points)  # Store to lookup dict quickly
 
-# Initialization variables for audio stream.
-SAMPLE_RATE = 44100
 
 
-def load_and_resample(file_path, target_sr=SAMPLE_RATE):
+def load_and_resample(file_path):
     """Load an audio file, convert it to mono, and resample if necessary."""
     try:
         import soundfile as sf
@@ -61,15 +54,17 @@ def load_and_resample(file_path, target_sr=SAMPLE_RATE):
         data, sr = sf.read(file_path)
     except Exception as e:
         # Fall back to scipy wavfile if soundfile fails
+        import scipy.io.wavfile
+
         sr, data = scipy.io.wavfile.read(file_path)
         data = data.astype(np.float32) / 32768.0  # normalize
 
     if data.ndim > 1:
         data = data[:, 0]
 
-    if sr != target_sr:
-        print(f"Resampling from {sr} to {target_sr}...")
-        data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
+    if sr != DEFAULT_SAMPLE_RATE:
+        print(f"Resampling from {sr} to {DEFAULT_SAMPLE_RATE}...")
+        data = librosa.resample(data, orig_sr=sr, target_sr=DEFAULT_SAMPLE_RATE)
 
     return data
 
@@ -81,7 +76,7 @@ def butter_lp(cutoff, fs, order):
     return sos
 
 
-def butter_lp_filter(signal, cutoff, fs=SAMPLE_RATE, order=1):
+def butter_lp_filter(signal, cutoff, fs=DEFAULT_SAMPLE_RATE, order=1):
     sos = butter_lp(cutoff=cutoff, fs=fs, order=order)
     out = scipy.signal.sosfiltfilt(sos, signal)
     return out
@@ -94,7 +89,7 @@ def butter_hp(cutoff, fs, order):
     return sos
 
 
-def butter_hp_filter(signal, cutoff, fs=SAMPLE_RATE, order=1):
+def butter_hp_filter(signal, cutoff, fs=DEFAULT_SAMPLE_RATE, order=1):
     """Filter a signal with the filter designed in ´butter_hp´.
 
     Filfilt applies the linear filter twice, once forward and once
@@ -215,9 +210,9 @@ T_INV = calculate_T_inv(triang=TRI, points=POINTS)
 class SpatialSound:
     """Encapsulates a mono sound with spatial trajectory properties."""
 
-    def __init__(self, dry_mono, sr, start_dist, start_azi, end_dist, end_azi, is_circular=False, speed=None):
+    def __init__(self, dry_mono, start_dist, start_azi, end_dist, end_azi, is_circular=False, speed=None):
         self.dry_mono = dry_mono
-        self.sr = sr
+        self.sr = DEFAULT_SAMPLE_RATE
         self.start_dist = start_dist
         self.start_azi = start_azi
         self.end_dist = end_dist
@@ -227,8 +222,9 @@ class SpatialSound:
         self.is_stationary = (abs(start_azi - end_azi) < 0.5) and (abs(start_dist - end_dist) < 0.1)
 
     @staticmethod
-    def generate_random(dry_mono, sr, max_distance, moving_prob=0.5, max_speed=3.0):
+    def generate_random(dry_mono, max_distance, moving_prob=0.5, max_speed=3.0):
         """Factory method to create a SpatialSound with a random trajectory."""
+        sr = DEFAULT_SAMPLE_RATE
         import random
 
         duration_sec = len(dry_mono) / sr
@@ -282,7 +278,6 @@ class SpatialSound:
 
         return SpatialSound(
             dry_mono=dry_mono,
-            sr=sr,
             start_dist=start_dist,
             start_azi=start_azi,
             end_dist=end_dist,
@@ -296,7 +291,7 @@ class SpatialSound:
         cache.initialize()
 
         dry_data = self.dry_mono
-        sr = self.sr
+        sr = DEFAULT_SAMPLE_RATE
         n_samples = len(dry_data)
 
         # Initialize M (tap length) from any HRIR in the cache
@@ -440,9 +435,9 @@ if __name__ == "__main__":
     if not os.path.exists(audio_path):
         print(f"Error: {audio_path} not found.")
     else:
-        dry_data = load_and_resample(audio_path, target_sr=sr)
+        dry_data = load_and_resample(audio_path)
 
-        sound = SpatialSound(dry_mono=dry_data, sr=sr, start_dist=3.0, start_azi=0.0, end_dist=3.0, end_azi=180.0)
+        sound = SpatialSound(dry_mono=dry_data, start_dist=3.0, start_azi=0.0, end_dist=3.0, end_azi=180.0)
         stereo_buffer = sound.compute_stereo()
 
         print(f"Writing to {output_path}...")

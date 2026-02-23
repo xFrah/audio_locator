@@ -4,6 +4,9 @@ DEFAULT_N_FFT = 2048
 DEFAULT_HOP_LENGTH = 512
 DEFAULT_WINDOW_SIZE_SECONDS = 2.0
 DEFAULT_GCC_MAX_TAU = 64  # Number of lag bins to keep from GCC-PHAT
+MAX_RMS_THRESHOLD = 0.15
+RMS_WINDOW_DURATION = 0.05  # 50ms for instantaneous intensity
+AZI_BINS = 180
 
 # Derived constants
 DEFAULT_FREQ_BINS = DEFAULT_N_FFT // 2 + 1  # 1025

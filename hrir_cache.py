@@ -103,10 +103,6 @@ class HRIRCache:
         if use_shared_memory and self.shm_meta:
             self._setup_shared_memory(self.shm_meta, quiet=quiet)
 
-    def generate_grid(self, **kwargs):
-        """Deprecated: use initialize(pool=..., use_shared_memory=True, ...) instead."""
-        self.initialize(use_shared_memory=True, **kwargs)
-
     def _setup_shared_memory(self, local_cache, quiet=True):
         """Initializes shared memory from a local cache dictionary."""
         if not quiet:

@@ -23,7 +23,7 @@ if __name__ == "__main__":
         exit(1)
 
     # 1. Load Audio
-    dry_data = load_and_resample(input_audio_path, target_sr=DEFAULT_SAMPLE_RATE)
+    dry_data = load_and_resample(input_audio_path)
 
     # 3. Create SpatialSound object for orbiting (circular) motion
     # From 0 to 360 * num_rotations
@@ -34,7 +34,6 @@ if __name__ == "__main__":
 
     sound = SpatialSound(
         dry_mono=dry_data,
-        sr=DEFAULT_SAMPLE_RATE,
         start_dist=orbit_distance,
         start_azi=0.0,
         end_dist=orbit_distance,

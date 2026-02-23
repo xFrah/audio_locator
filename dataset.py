@@ -19,9 +19,6 @@ from config import *
 _persistent_pool = ProcessPoolExecutor(max_workers=max(1, os.cpu_count() - 1))
 # _persistent_pool = ProcessPoolExecutor(max_workers=8)
 
-MAX_RMS_THRESHOLD = 0.15
-RMS_WINDOW_DURATION = 0.05  # 50ms for instantaneous intensity
-
 # Match slab's HRIR samplerate to our audio pipeline
 slab.set_default_samplerate(DEFAULT_SAMPLE_RATE)
 
@@ -32,9 +29,7 @@ def compute_t_frames(window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS, sr=DEFAULT
     return total_samples // hop_length + 1
 
 
-def compute_spatial_features(
-    y_left, y_right, sr=DEFAULT_SAMPLE_RATE, n_fft=DEFAULT_N_FFT, hop_length=DEFAULT_HOP_LENGTH, n_gcc_bins=DEFAULT_GCC_MAX_TAU
-):
+def compute_spatial_features(y_left, y_right, sr=DEFAULT_SAMPLE_RATE, n_fft=DEFAULT_N_FFT, hop_length=DEFAULT_HOP_LENGTH, n_gcc_bins=DEFAULT_GCC_MAX_TAU):
     """Compute all spatial audio features from a stereo pair.
 
     Returns:
@@ -90,9 +85,7 @@ def compute_spatial_features(
     return spatial_features, gcc_features
 
 
-def prepare_audio_input_librosa(
-    file_path, window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS, sr=DEFAULT_SAMPLE_RATE, n_fft=DEFAULT_N_FFT, hop_length=DEFAULT_HOP_LENGTH
-):
+def prepare_audio_input_librosa(file_path, window_size_seconds=DEFAULT_WINDOW_SIZE_SECONDS, sr=DEFAULT_SAMPLE_RATE, n_fft=DEFAULT_N_FFT, hop_length=DEFAULT_HOP_LENGTH):
     # 1. Load audio (mono=False keeps it stereo)
     y, _ = librosa.load(file_path, sr=sr, mono=False)
 
@@ -336,7 +329,6 @@ def generate_epoch(
                 # Movement logic and object creation
                 sound_obj = HRTF_convolver.SpatialSound.generate_random(
                     dry_mono=dry_mono,
-                    sr=sr,
                     max_distance=max_distance,
                     moving_prob=moving_prob,
                     max_speed=max_speed,
@@ -535,10 +527,6 @@ def generate_epoch(
                     else:
                         half_angle_rad = np.arcsin(radius / current_dist)
                         width_deg = 2.0 * np.degrees(half_angle_rad)
-
-                    width_bins = max(1, int(round(width_deg / 360 * azi_bins)))
-
-                    azi_idx = round(current_azi / 360 * azi_bins) % azi_bins
 
                     # Accumulate (flat top + gaussian tails)
                     azi_idx_float = current_azi / 360 * azi_bins

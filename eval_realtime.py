@@ -1,6 +1,5 @@
 import os
 import time
-import argparse
 import librosa
 import numpy as np
 import torch
@@ -20,14 +19,14 @@ def evaluate_realtime(
     sr=DEFAULT_SAMPLE_RATE,
 ):
     if device is None:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        device = "cuda:1" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
     # --- Load Model ---
     model = SpatialAudioHeatmapLocator(
         input_channels=NUM_SPATIAL_CHANNELS,
         gcc_channels=NUM_GCC_CHANNELS,
-        azi_bins=180,
+        azi_bins=AZI_BINS,
     ).to(device)
 
     if os.path.exists(model_path):
