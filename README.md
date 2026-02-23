@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey?style=for-the-badge&logo=creative-commons" alt="License">
 </p>
 
-**Audio Locator** is a neural network-based model designed to identify and track the azimuth of sound sources in real-time. 
+**Audio Locator** is a neural network-based model designed to identify and track the azimuth of sound sources(in stereo audio) in real-time. 
 
 The system generates synthetic data using HRTFs to simulate realistic sound propagation in a 3D space, then trains on it until it learns to precisely predict the azimuth of sound sources.
 
