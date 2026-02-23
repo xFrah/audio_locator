@@ -34,8 +34,7 @@ def bce_loss(pred_logits, target):
     )
 
 
-def train(epochs=100, batch_size=24, lr=1e-5
-, azi_bins=180, epoch_duration_seconds=5000, device=None):
+def train(epochs=100, batch_size=24, lr=1e-6, azi_bins=180, epoch_duration_seconds=5000, device=None):
 
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -65,7 +64,7 @@ def train(epochs=100, batch_size=24, lr=1e-5
 
     # --- Data generation config ---
     num_sounds = int(epoch_duration_seconds * 1)
-    gen_kwargs = dict(total_duration_seconds=epoch_duration_seconds, num_sounds=num_sounds, update_interval_ms=2000, max_velocity=90, moving_prob=0.8)
+    gen_kwargs = dict(total_duration_seconds=epoch_duration_seconds, num_sounds=num_sounds, update_interval_ms=2000, max_speed=5.0, moving_prob=0.8)
 
     # --- Training loop ---
     best_loss = float("inf")

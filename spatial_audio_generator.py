@@ -1,11 +1,8 @@
 import os
-import librosa
 import numpy as np
 import soundfile as sf
-import scipy.signal
 
-import HRTF_convolver
-from HRTF_convolver import load_and_resample, load_hrir_cache, SpatialSound
+from HRTF_convolver import load_and_resample, SpatialSound
 from convert_wav import DEFAULT_SAMPLE_RATE
 
 
@@ -27,9 +24,6 @@ if __name__ == "__main__":
 
     # 1. Load Audio
     dry_data = load_and_resample(input_audio_path, target_sr=DEFAULT_SAMPLE_RATE)
-
-    # 2. Load HRIR Cache
-    load_hrir_cache()
 
     # 3. Create SpatialSound object for orbiting (circular) motion
     # From 0 to 360 * num_rotations

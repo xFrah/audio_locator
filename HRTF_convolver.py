@@ -13,6 +13,7 @@ are other sound samples in the folder resources/sound.
 import os
 import wave
 import itertools
+from hrir_cache import cache
 import pickle
 
 import scipy.io
@@ -144,7 +145,7 @@ def calculate_T_inv(triang, points):
     return T_inv
 
 
-def interp_hrir(triang, points, T_inv, hrir_dict, azimuth, distance):
+def interp_hrir(triang, points, T_inv, azimuth, distance):
     azimuth = float(azimuth) % 360.0
     distance = np.clip(float(distance), DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
 
@@ -158,7 +159,7 @@ def interp_hrir(triang, points, T_inv, hrir_dict, azimuth, distance):
         n_azi, n_dist = _POINTS_POLAR[nearest]
         azi_key = float(n_azi) if n_azi < 360.0 else 0.0
         dist_key = round(float(n_dist), 2)
-        h_l, h_r = hrir_dict[(azi_key, dist_key)]
+        h_l, h_r = cache[(azi_key, dist_key)]
         return h_l.copy(), h_r.copy()
 
     vert = points[triang.simplices[triangle]]
@@ -172,13 +173,13 @@ def interp_hrir(triang, points, T_inv, hrir_dict, azimuth, distance):
 
     if g_1 >= 0 and g_2 >= 0 and g_3 >= 0:
         azi0 = float(vert_polar[0][0]) if vert_polar[0][0] < 360.0 else 0.0
-        h0_l, h0_r = hrir_dict[(azi0, round(float(vert_polar[0][1]), 2))]
+        h0_l, h0_r = cache[(azi0, round(float(vert_polar[0][1]), 2))]
 
         azi1 = float(vert_polar[1][0]) if vert_polar[1][0] < 360.0 else 0.0
-        h1_l, h1_r = hrir_dict[(azi1, round(float(vert_polar[1][1]), 2))]
+        h1_l, h1_r = cache[(azi1, round(float(vert_polar[1][1]), 2))]
 
         azi2 = float(vert_polar[2][0]) if vert_polar[2][0] < 360.0 else 0.0
-        h2_l, h2_r = hrir_dict[(azi2, round(float(vert_polar[2][1]), 2))]
+        h2_l, h2_r = cache[(azi2, round(float(vert_polar[2][1]), 2))]
 
         max_len = max(len(h0_l), len(h1_l), len(h2_l))
 
@@ -203,195 +204,12 @@ def interp_hrir(triang, points, T_inv, hrir_dict, azimuth, distance):
     n_azi, n_dist = vert_polar[nearest]
     azi_key = float(n_azi) if n_azi < 360.0 else 0.0
     dist_key = round(float(n_dist), 2)
-    h_l, h_r = hrir_dict[(azi_key, dist_key)]
+    h_l, h_r = cache[(azi_key, dist_key)]
     return h_l.copy(), h_r.copy()
 
 
 TRI = create_triangulation(points=POINTS)
 T_INV = calculate_T_inv(triang=TRI, points=POINTS)
-
-# Shared Memory for HRIRs
-HRIR_CACHE_PATH = "hrir_cache.pkl"
-_hrir_shm_meta = None  # dict: (azi, dist) -> (offset_L, offset_R, length) or directly (h_L, h_R) if from disk
-_hrir_shm_array = None  # ndarray mapped to shared memory
-
-
-def load_hrir_cache():
-    """Load precomputed HRIRs from grid cache (disk only)."""
-    global _hrir_shm_meta, _hrir_shm_array
-    local_cache = {}
-    if os.path.exists(HRIR_CACHE_PATH):
-        print(f"Loading HRIR cache from {HRIR_CACHE_PATH}...")
-        with open(HRIR_CACHE_PATH, "rb") as f:
-            local_cache = pickle.load(f)
-        print(f"Loaded {len(local_cache)} cached HRIRs")
-    else:
-        print(f"WARNING: {HRIR_CACHE_PATH} not found. Run dataset generation first to create it.")
-    _hrir_shm_meta = local_cache
-    _hrir_shm_array = None
-
-
-def _lookup_hrir(azi_deg, dist_m, azi_step=0.5, dist_steps=None, max_distance=None, room_size=[10.0, 10.0, 3.0], listener_pos=[5.0, 5.0, 1.5]):
-    global _hrir_shm_meta
-    if _hrir_shm_meta is None:
-        raise RuntimeError("HRIR cache not initialized.")
-    if max_distance is None:
-        lx, ly, _ = listener_pos
-        rx, ry, _ = room_size
-        max_distance = min(lx, rx - lx, ly, ry - ly)
-    if dist_steps is None:
-        dist_steps = np.linspace(0.3, max_distance, 40)
-    azi_snapped = float(round(azi_deg / azi_step) * azi_step % 360)
-    dist_snapped = round(float(dist_steps[np.argmin(np.abs(dist_steps - dist_m))]), 2)
-    try:
-        hrir_L, hrir_R = _hrir_shm_meta[(azi_snapped, dist_snapped)]
-    except KeyError:
-        return None, None
-    return hrir_L, hrir_R
-
-
-def generate_moving_sound(dry_data, sr, start_azi, start_dist, end_azi, end_dist, hrir_cache=None, normalize=True, is_circular=False, speed=None):
-    import random
-    from convert_wav import DEFAULT_SAMPLE_RATE
-
-    n_samples = len(dry_data)
-    duration_sec = n_samples / sr
-
-    if hrir_cache is None:
-        global _hrir_shm_meta
-        if _hrir_shm_meta is None:
-            raise RuntimeError("HRIR cache not initialized. Call load_hrir_cache() first or pass arguably to hrir_cache.")
-        hrir_cache = _hrir_shm_meta
-
-    first_val = next(iter(hrir_cache.values()))
-    if len(first_val) == 3:  # In case of shared memory meta (off_L, off_R, length)
-        M = first_val[2]
-    else:
-        M = len(first_val[0])
-    is_stationary = (abs(start_azi - end_azi) < 0.5) and (abs(start_dist - end_dist) < 0.1)
-
-    if is_stationary:
-        from scipy.signal import fftconvolve
-
-        h_l, h_r = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=hrir_cache, azimuth=start_azi, distance=start_dist)
-        spatial_L = fftconvolve(dry_data, h_l, mode="full").astype(np.float32)
-        spatial_R = fftconvolve(dry_data, h_r, mode="full").astype(np.float32)
-        stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
-
-        if normalize:
-            peak = np.max(np.abs(stereo_buffer))
-            if peak > 0:
-                stereo_buffer = stereo_buffer / peak * 0.9
-
-        return stereo_buffer
-
-    out_length = n_samples + M - 1
-    spatial_L = np.zeros(out_length, dtype=np.float32)
-    spatial_R = np.zeros(out_length, dtype=np.float32)
-
-    cutoff_freq = 200.0
-    dry_data_lp = butter_lp_filter(signal=dry_data, cutoff=cutoff_freq)
-    dry_data = butter_hp_filter(signal=dry_data, cutoff=cutoff_freq)
-
-    from scipy.signal import fftconvolve, get_window
-
-    window_size = 2048
-    hop = window_size // 2
-    window = get_window("hann", window_size).astype(np.float32)
-
-    # Convert start/end to Cartesian
-    sa_rad = np.radians(start_azi)
-    ea_rad = np.radians(end_azi)
-
-    # Create a dummy SpatialSound object for trajectory calculations
-    trajectory = SpatialSound(
-        dry_mono=dry_data,
-        sr=sr,
-        start_dist=start_dist,
-        start_azi=start_azi,
-        end_dist=end_dist,
-        end_azi=end_azi,
-        is_circular=is_circular,
-        speed=speed,
-    )
-
-    for b_start in range(0, n_samples - window_size + 1, hop):
-        b_end = b_start + window_size
-        x_r = dry_data[b_start:b_end] * window
-        x_r_lp = dry_data_lp[b_start:b_end] * window
-
-        progress = (b_start + hop) / n_samples
-        azi1, dist1 = trajectory.get_pos(progress)
-
-        h_l_next, h_r_next = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=hrir_cache, azimuth=azi1, distance=dist1)
-
-        conv_L_cross = fftconvolve(x_r, h_l_next, mode="full")
-        conv_R_cross = fftconvolve(x_r, h_r_next, mode="full")
-
-        # Align low frequencies to the peak of the direct path of the HRIR
-        peak_idx = np.argmax(np.abs(h_l_next))
-        lp_start = b_start + peak_idx
-
-        if lp_start < out_length:
-            write_len_lp = min(len(x_r_lp), out_length - lp_start)
-            spatial_L[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
-            spatial_R[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
-
-        l_conv = len(conv_L_cross)
-        target_end = min(b_start + l_conv, out_length)
-        write_len_hp = target_end - b_start
-
-        if write_len_hp > 0:
-            spatial_L[b_start:target_end] += conv_L_cross[:write_len_hp]
-            spatial_R[b_start:target_end] += conv_R_cross[:write_len_hp]
-
-    stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
-
-    if normalize:
-        peak = np.max(np.abs(stereo_buffer))
-        if peak > 0:
-            stereo_buffer = stereo_buffer / peak * 0.9
-
-    return stereo_buffer
-
-    for b_start in range(0, n_samples - window_size + 1, hop):
-        b_end = b_start + window_size
-        x_r = dry_data[b_start:b_end] * window
-        x_r_lp = dry_data_lp[b_start:b_end] * window
-
-        progress = (b_start + hop) / n_samples
-        azi1, dist1 = get_pos(progress)
-
-        h_l_next, h_r_next = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, hrir_dict=hrir_cache, azimuth=azi1, distance=dist1)
-
-        conv_L_cross = fftconvolve(x_r, h_l_next, mode="full")
-        conv_R_cross = fftconvolve(x_r, h_r_next, mode="full")
-
-        # Align low frequencies to the peak of the direct path of the HRIR
-        peak_idx = np.argmax(np.abs(h_l_next))
-        lp_start = b_start + peak_idx
-
-        if lp_start < out_length:
-            write_len_lp = min(len(x_r_lp), out_length - lp_start)
-            spatial_L[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
-            spatial_R[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
-
-        l_conv = len(conv_L_cross)
-        target_end = min(b_start + l_conv, out_length)
-        write_len_hp = target_end - b_start
-
-        if write_len_hp > 0:
-            spatial_L[b_start:target_end] += conv_L_cross[:write_len_hp]
-            spatial_R[b_start:target_end] += conv_R_cross[:write_len_hp]
-
-    stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
-
-    if normalize:
-        peak = np.max(np.abs(stereo_buffer))
-        if peak > 0:
-            stereo_buffer = stereo_buffer / peak * 0.9
-
-    return stereo_buffer
 
 
 class SpatialSound:
@@ -409,7 +227,7 @@ class SpatialSound:
         self.is_stationary = (abs(start_azi - end_azi) < 0.5) and (abs(start_dist - end_dist) < 0.1)
 
     @staticmethod
-    def generate_random(dry_mono, sr, max_distance, moving_prob=0.5):
+    def generate_random(dry_mono, sr, max_distance, moving_prob=0.5, max_speed=3.0):
         """Factory method to create a SpatialSound with a random trajectory."""
         import random
 
@@ -426,7 +244,7 @@ class SpatialSound:
 
         if random.random() < moving_prob and duration_sec > 0.5:
             is_circular = random.random() < 0.5
-            speed = random.uniform(0.5, 3.0)  # m/s (Reasonable walking/running speed)
+            speed = random.uniform(0.5, max_speed)  # m/s
 
             if not is_circular:
                 # Random velocity vector (Linear)
@@ -473,20 +291,85 @@ class SpatialSound:
             speed=speed,
         )
 
-    def compute_stereo(self, hrir_cache=None, normalize=True):
+    def compute_stereo(self, normalize=True):
         """Computes the stereo audio based on the trajectory."""
-        return generate_moving_sound(
-            self.dry_mono,
-            self.sr,
-            self.start_azi,
-            self.start_dist,
-            self.end_azi,
-            self.end_dist,
-            hrir_cache=hrir_cache,
-            normalize=normalize,
-            is_circular=self.is_circular,
-            speed=self.speed,
-        )
+        cache.initialize()
+
+        dry_data = self.dry_mono
+        sr = self.sr
+        n_samples = len(dry_data)
+
+        # Initialize M (tap length) from any HRIR in the cache
+        first_hrir_pair = next(iter(cache.values()))
+        M = len(first_hrir_pair[0])
+
+        if self.is_stationary:
+            from scipy.signal import fftconvolve
+
+            h_l, h_r = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, azimuth=self.start_azi, distance=self.start_dist)
+            spatial_L = fftconvolve(dry_data, h_l, mode="full").astype(np.float32)
+            spatial_R = fftconvolve(dry_data, h_r, mode="full").astype(np.float32)
+            stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
+
+            if normalize:
+                peak = np.max(np.abs(stereo_buffer))
+                if peak > 0:
+                    stereo_buffer = stereo_buffer / peak * 0.9
+
+            return stereo_buffer
+
+        out_length = n_samples + M - 1
+        spatial_L = np.zeros(out_length, dtype=np.float32)
+        spatial_R = np.zeros(out_length, dtype=np.float32)
+
+        cutoff_freq = 200.0
+        dry_data_lp = butter_lp_filter(signal=dry_data, cutoff=cutoff_freq)
+        dry_data_hp = butter_hp_filter(signal=dry_data, cutoff=cutoff_freq)
+
+        from scipy.signal import fftconvolve, get_window
+
+        window_size = 2048
+        hop = window_size // 2
+        window = get_window("hann", window_size).astype(np.float32)
+
+        for b_start in range(0, n_samples - window_size + 1, hop):
+            # Use high-pass for convolution
+            x_r_hp = dry_data_hp[b_start : b_start + window_size] * window
+            x_r_lp = dry_data_lp[b_start : b_start + window_size] * window
+
+            progress = (b_start + hop) / n_samples
+            azi1, dist1 = self.get_pos(progress)
+
+            h_l_next, h_r_next = interp_hrir(triang=TRI, points=POINTS, T_inv=T_INV, azimuth=azi1, distance=dist1)
+
+            conv_L_cross = fftconvolve(x_r_hp, h_l_next, mode="full")
+            conv_R_cross = fftconvolve(x_r_hp, h_r_next, mode="full")
+
+            # Align low frequencies to the peak of the direct path of the HRIR
+            peak_idx = np.argmax(np.abs(h_l_next))
+            lp_start = b_start + peak_idx
+
+            if lp_start < out_length:
+                write_len_lp = min(len(x_r_lp), out_length - lp_start)
+                spatial_L[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
+                spatial_R[lp_start : lp_start + write_len_lp] += x_r_lp[:write_len_lp]
+
+            l_conv = len(conv_L_cross)
+            target_end = min(b_start + l_conv, out_length)
+            write_len_hp = target_end - b_start
+
+            if write_len_hp > 0:
+                spatial_L[b_start:target_end] += conv_L_cross[:write_len_hp]
+                spatial_R[b_start:target_end] += conv_R_cross[:write_len_hp]
+
+        stereo_buffer = np.stack((spatial_L, spatial_R), axis=0)
+
+        if normalize:
+            peak = np.max(np.abs(stereo_buffer))
+            if peak > 0:
+                stereo_buffer = stereo_buffer / peak * 0.9
+
+        return stereo_buffer
 
     def get_pos(self, progress):
         """Calculates the (azimuth, distance) at a given progress [0, 1]."""
@@ -559,8 +442,8 @@ if __name__ == "__main__":
     else:
         dry_data = load_and_resample(audio_path, target_sr=sr)
 
-        load_hrir_cache()
-        stereo_buffer = generate_moving_sound(dry_data, sr, start_azi=0, start_dist=3.0, end_azi=180, end_dist=3.0)
+        sound = SpatialSound(dry_mono=dry_data, sr=sr, start_dist=3.0, start_azi=0.0, end_dist=3.0, end_azi=180.0)
+        stereo_buffer = sound.compute_stereo()
 
         print(f"Writing to {output_path}...")
         sf.write(output_path, stereo_buffer.T, sr)

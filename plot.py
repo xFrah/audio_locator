@@ -1,6 +1,7 @@
 import multiprocessing as mp
 import queue
 import numpy as np
+import HRTF_convolver
 
 
 class LiveComparisonPlot:
@@ -95,59 +96,25 @@ class LiveComparisonPlot:
                     curr_x = m["current_pos"][1] * np.sin(curr_azi_rad)
                     curr_y = m["current_pos"][1] * np.cos(curr_azi_rad)
 
-                    # Check if moving
-                    is_stationary = m.get("is_stationary", False)
-                    is_moving = not is_stationary
+                    # Retrieve sound properties from the object
+                    sound_obj = m["sound_obj"]
+                    is_moving = not sound_obj.is_stationary
 
                     if is_moving:
                         color = "r"  # Moving = Red
 
-                        # Convert start to Cartesian for plotting
-                        start_azi_deg, start_dist = m["traj_start"]
-                        start_azi_rad = np.radians(start_azi_deg)
-                        start_x = start_dist * np.sin(start_azi_rad)
-                        start_y = start_dist * np.cos(start_azi_rad)
+                        # Calculate current progress based on window end relative to sound duration
+                        progress = (m["win_range"][1] - m["start_sample"]) / (m["end_sample"] - m["start_sample"])
+                        progress = np.clip(progress, 0.0, 1.0)
 
-                        if m.get("is_circular", False):
-                            # Draw arc for circular trajectory
-                            # We can approximate with many segments
-                            # We need to calculate the path from start to current
-                            # Using the same logic as HRTF_convolver.get_spatial_pos
+                        # Compute trajectory points on-the-fly for visualization
+                        n_traj_steps = 50
+                        traj_pts = [sound_obj.get_pos(p) for p in np.linspace(0, progress, n_traj_steps)]
 
-                            direction = 1.0 if (m["traj_end"][0] - m["traj_start"][0]) > 0 else -1.0
-
-                            # Current progress (relative to whole sound duration)
-                            # Actually, we can just interpolate from start_azi to curr_azi
-                            # assuming it's circular at constant distance
-
-                            # However, current_pos already contains the correctly calculated azi
-                            curr_azi_deg = m["current_pos"][0]
-
-                            # We need to know the total angle covered.
-                            # Since we don't have 'velocity' easily here (we have speed),
-                            # but we do have m['current_pos'][0], we can just draw the arc from start to curr.
-
-                            # Note: if it spun multiple times, we might only see the last wrap.
-                            # But for visualization, drawing the shortest arc or the correct direction is enough.
-
-                            # Determine angular distance to cover
-                            if direction > 0:
-                                if curr_azi_deg < start_azi_deg:
-                                    curr_azi_deg += 360
-                            else:
-                                if curr_azi_deg > start_azi_deg:
-                                    curr_azi_deg -= 360
-
-                            steps = 20
-                            arc_azis = np.linspace(start_azi_deg, curr_azi_deg, steps)
-                            arc_rads = np.radians(arc_azis)
-                            arc_xs = start_dist * np.sin(arc_rads)
-                            arc_ys = start_dist * np.cos(arc_rads)
-                            ax_map.plot(arc_xs, arc_ys, "-", color=color, alpha=0.3)
-                        else:
-                            # Draw straight trajectory (Cartesian)
-                            ax_map.plot([start_x, curr_x], [start_y, curr_y], "-", color=color, alpha=0.3)
-
+                        if traj_pts:
+                            path_x = [p_dist * np.sin(np.radians(p_azi)) for p_azi, p_dist in traj_pts]
+                            path_y = [p_dist * np.cos(np.radians(p_azi)) for p_azi, p_dist in traj_pts]
+                            ax_map.plot(path_x, path_y, "-", color=color, alpha=0.3)
                     else:
                         color = "b"  # Static = Blue
 
