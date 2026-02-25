@@ -1,13 +1,91 @@
 import os
 import time
+import socket
 import librosa
 import numpy as np
 import torch
+import matplotlib.cm as cm
 
 from model import SpatialAudioHeatmapLocator
 from config import *
 from dataset import compute_spatial_features
 from plot import LivePredictionPlot
+
+
+class WLEDVisualizer:
+    def __init__(self, host="wled.local", num_leds=120, width_ratio=16, height_ratio=9):
+        self.num_leds = num_leds
+        self.host = host
+        self.port = 21324
+
+        try:
+            self.ip = socket.gethostbyname(host)
+        except socket.gaierror:
+            self.ip = host
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # DRGB protocol header: protocol 2, timeout 2 seconds
+        self.header = bytearray([2, 2])
+
+        # Precompute LED angles
+        path_length = 2 * (width_ratio + height_ratio)
+        half_w = width_ratio / 2
+        half_h = height_ratio / 2
+
+        angles = []
+        for i in range(num_leds):
+            pi = (i / num_leds) * path_length
+            if pi < height_ratio:
+                x, y = -half_w, -half_h + pi
+            elif pi < height_ratio + width_ratio:
+                x, y = -half_w + (pi - height_ratio), half_h
+            elif pi < 2 * height_ratio + width_ratio:
+                x, y = half_w, half_h - (pi - height_ratio - width_ratio)
+            else:
+                x, y = half_w - (pi - 2 * height_ratio - width_ratio), -half_h
+
+            theta = np.arctan2(x, y)
+            if theta < 0:
+                theta += 2 * np.pi
+            angles.append(theta)
+
+        self.angles = np.array(angles)
+
+    def update(self, pred_logits):
+        pred_prob = 1.0 / (1.0 + np.exp(-pred_logits))
+        azi_bins = pred_prob.shape[0]
+        bin_angles = np.linspace(0, 2 * np.pi, azi_bins + 1)
+        padded_prob = np.append(pred_prob, pred_prob[0])
+
+        interpolated_prob = np.interp(self.angles, bin_angles, padded_prob)
+
+        # Brightness: 0.4 -> 0.0, 1.0 -> 1.0
+        brightness = np.clip((interpolated_prob - 0.4) / (1.0 - 0.4), 0.0, 1.0)
+
+        red = (255 * brightness).astype(np.uint8)
+        green = np.zeros_like(red, dtype=np.uint8)
+        blue = np.zeros_like(red, dtype=np.uint8)
+
+        # Layout GRB
+        colors_grb = np.column_stack((green, red, blue))
+
+        packet = bytearray(self.header)
+        packet.extend(colors_grb.tobytes())
+
+        try:
+            self.sock.sendto(packet, (self.ip, self.port))
+        except Exception:
+            pass
+
+    def stop(self):
+        # Send one last black buffer to turn them off gracefully if real-time ends
+        packet = bytearray(self.header)
+        packet.extend(bytes([0, 0, 0] * self.num_leds))
+        try:
+            self.sock.sendto(packet, (self.ip, self.port))
+            self.sock.close()
+        except Exception:
+            pass
 
 
 def evaluate_realtime(
@@ -78,6 +156,7 @@ def evaluate_realtime(
 
     # --- Live Plot ---
     live_plot = LivePredictionPlot()
+    wled_plot = WLEDVisualizer(host="wled.local")
 
     # --- Warmup ---
     print("Warming up model and features...")
@@ -129,6 +208,7 @@ def evaluate_realtime(
             # Update live plot
             current_time_sec = (i + 1) * hop_duration
             live_plot.update(pred_np, current_time_sec)
+            wled_plot.update(pred_np)
 
             # Print occasional progress
             if (i + 1) % max(1, num_windows // 10) == 0 or i == 0:
@@ -136,6 +216,7 @@ def evaluate_realtime(
                 print(f"Chunk {i+1}/{num_windows} - Process Time: {chunk_duration*1000:.1f}ms ({hz:.1f} Hz)")
 
     live_plot.stop()
+    wled_plot.stop()
 
     # --- Summary ---
     print("-" * 50)
