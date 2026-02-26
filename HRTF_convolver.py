@@ -45,7 +45,6 @@ POINTS = np.array([polar_to_cartesian(a, d) for a, d in _polar_points])
 _POINTS_POLAR = np.array(_polar_points)  # Store to lookup dict quickly
 
 
-
 def load_and_resample(file_path):
     """Load an audio file, convert it to mono, and resample if necessary."""
     try:
@@ -291,7 +290,6 @@ class SpatialSound:
         cache.initialize()
 
         dry_data = self.dry_mono
-        sr = DEFAULT_SAMPLE_RATE
         n_samples = len(dry_data)
 
         # Initialize M (tap length) from any HRIR in the cache
@@ -420,6 +418,55 @@ class SpatialSound:
 
         dist = np.clip(dist, DISTANCE_STEPS[0], DISTANCE_STEPS[-1])
         return azi, dist
+
+    def get_frequency_composition(self, local_end_idx, intervals, window_samples=2048):
+        """
+        Calculates the percentage of the sound's energy in specific frequency intervals
+        at a given instant (local_end_idx).
+
+        Args:
+            local_end_idx (int): The sample index in the dry_mono array defining the end of the snapshot.
+            intervals (list of tuples): Expected as [(f_start1, f_end1), (f_start2, f_end2), ...].
+            window_samples (int): Length of the snapshot segment before local_end_idx.
+
+        Returns:
+            list of float: The percentage [0.0, 1.0] of energy for each frequency interval.
+        """
+        local_start_idx = max(0, local_end_idx - window_samples)
+        if local_end_idx <= 0 or local_start_idx >= len(self.dry_mono) or local_end_idx > len(self.dry_mono):
+            # If the requested snapshot is outside the bounds of the audio
+            # Adjust local_end_idx to make sense if partially outside, or return zeros
+            if local_start_idx >= len(self.dry_mono) or local_end_idx <= 0:
+                return [0.0] * len(intervals)
+
+        # Ensure we don't go out of bounds
+        actual_end_idx = min(local_end_idx, len(self.dry_mono))
+        segment = self.dry_mono[local_start_idx:actual_end_idx]
+
+        # If segment is completely silent or too short
+        if len(segment) == 0 or np.max(np.abs(segment)) < 1e-6:
+            return [0.0] * len(intervals)
+
+        # Apply a Hann window for smoother FFT
+        window = np.hanning(len(segment))
+        windowed_segment = segment * window
+
+        # Compute power spectrum using real FFT
+        spectrum = np.abs(np.fft.rfft(windowed_segment)) ** 2
+        freqs = np.fft.rfftfreq(len(segment), d=1.0 / self.sr)
+
+        total_power = np.sum(spectrum)
+        if total_power == 0.0:
+            return [0.0] * len(intervals)
+
+        percentages = []
+        for f_min, f_max in intervals:
+            # Find indices where frequency is strictly within the interval [f_min, f_max)
+            idx_mask = (freqs >= f_min) & (freqs < f_max)
+            interval_power = np.sum(spectrum[idx_mask])
+            percentages.append(float(interval_power / total_power))
+
+        return percentages
 
 
 if __name__ == "__main__":
