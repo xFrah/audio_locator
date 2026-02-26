@@ -19,14 +19,31 @@ class HRIRCache:
         self.shm_array = None
         self.shm_meta = None  # dict: (azi, dist) -> (offset_L, offset_R, length)
 
-    def _compute_hrir_worker(self, args):
-        """Worker function for HRIR computation."""
-        azi_deg, dist_m, room_size, listener_pos = args
-        room = slab.Room(size=room_size, listener=listener_pos)
-        room.set_source([float(azi_deg), 0, float(dist_m)])
-        hrir = room.hrir(reverb=False)
-        hrir_data = hrir.data  # (n_taps, 2)
-        return float(azi_deg), round(dist_m, 2), hrir_data[:, 0].copy(), hrir_data[:, 1].copy()
+
+def _compute_hrir_worker(args):
+    """Worker function for HRIR computation."""
+    azi_deg, dist_m, room_size, listener_pos = args
+    import slab
+
+    room = slab.Room(size=room_size, listener=listener_pos, absorption=[1.0, 1.0, 1.0])
+    room.set_source([float(azi_deg), 0, float(dist_m)])
+    hrir = room.hrir(reverb=None)
+    hrir_data = hrir.data  # (n_taps, 2)
+    return float(azi_deg), round(dist_m, 2), hrir_data[:, 0].copy(), hrir_data[:, 1].copy()
+
+
+class HRIRCache:
+    """Manages precomputation, caching, and shared memory access for HRIRs."""
+
+    def __init__(self, pool=None, shm_name="hrir_cache_shm", cache_path="hrir_cache.pkl"):
+        self.pool = pool
+        self.shm_name = shm_name
+        self.cache_path = cache_path
+
+        # State
+        self.shm = None
+        self.shm_array = None
+        self.shm_meta = None  # dict: (azi, dist) -> (offset_L, offset_R, length)
 
     def initialize(
         self,
@@ -90,7 +107,12 @@ class HRIRCache:
 
             if missing_jobs:
                 print(f"Precomputing {len(missing_jobs)} missing HRIRs...")
-                results = tqdm(self.pool.map(self._compute_hrir_worker, missing_jobs, chunksize=50), total=len(missing_jobs), desc="Generating HRIRs", leave=False)
+                results = tqdm(
+                    self.pool.map(_compute_hrir_worker, missing_jobs, chunksize=50),
+                    total=len(missing_jobs),
+                    desc="Generating HRIRs",
+                    leave=False,
+                )
 
                 for azi_deg, dist_m, hrir_L, hrir_R in results:
                     local_cache[(azi_deg, dist_m)] = (hrir_L, hrir_R)
